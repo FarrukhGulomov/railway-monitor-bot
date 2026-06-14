@@ -323,7 +323,7 @@ async def _confirm_and_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
     asyncio.create_task(
-        _monitor_loop(uid, mid, monitor, update._application)
+        _monitor_loop(uid, mid, monitor, context.application)
     )
 
 
