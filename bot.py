@@ -21,7 +21,7 @@ from telegram.ext import (
 )
 
 from config import Config
-from railway_client import get_client
+from railway_client import RailwayClient
 from database import Database
 from security import SecurityMiddleware
 
@@ -329,12 +329,12 @@ async def _confirm_and_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 # ─── Monitor loop ───────────────────────────────────────────────────────────────
 async def _monitor_loop(uid: int, mid: str, data: dict, app):
-    client = await get_client()
+    client = RailwayClient()
     logger.info(f"Monitor boshlandi: uid={uid} mid={mid}")
 
     while db.is_active(mid):
         try:
-            trains = await client.search_trains(
+            trains = client.search_trains(
                 data["from_code"],
                 data["to_code"],
                 data["date"],

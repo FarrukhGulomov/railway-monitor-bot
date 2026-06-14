@@ -1,156 +1,142 @@
 """
-Railway.uz API Client — Playwright (haqiqiy brauzer)
-Cloudflare himoyasini chetlab o'tadi
+Railway.uz API Client
+O'zbekiston proxy orqali ishlaydi
 """
 
-import asyncio
+import requests
 import logging
-import json
-from datetime import datetime
-from typing import Optional
+import time
+import os
 
 logger = logging.getLogger("railway_client")
 
+BASE = "https://eticket.railway.uz"
+SEARCH_URL = f"{BASE}/api/v3/handbook/trains/list"
+
+HEADERS = {
+    "Accept": "application/json",
+    "Content-Type": "application/json",
+    "Accept-Language": "uz",
+    "Origin": BASE,
+    "Referer": f"{BASE}/",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+}
+
 
 class RailwayClient:
-    BASE = "https://eticket.railway.uz"
-    SEARCH_URL = f"{BASE}/api/v3/handbook/trains/list"
+    TIMEOUT = 20
+    MAX_RETRIES = 3
+    MIN_INTERVAL = 5.0
 
     def __init__(self):
-        self._browser = None
-        self._context = None
-        self._page = None
-        self._ready = False
+        self._session = requests.Session()
+        self._session.headers.update(HEADERS)
+        self._last_request = 0.0
 
-    async def start(self):
-        """Brauzerni ishga tushirish"""
+        # Proxy sozlash
+        proxy_url = os.getenv("PROXY_URL", "").strip()
+        if proxy_url:
+            self._session.proxies = {
+                "http": proxy_url,
+                "https": proxy_url,
+            }
+            logger.info(f"Proxy: {proxy_url}")
+        else:
+            logger.warning("PROXY_URL sozlanmagan — to'g'ridan uriniladi")
+
+        self._init_session()
+
+    def _init_session(self):
         try:
-            from playwright.async_api import async_playwright
-            self._pw = await async_playwright().start()
-            self._browser = await self._pw.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-blink-features=AutomationControlled",
-                ]
-            )
-            self._context = await self._browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/120.0.0.0 Safari/537.36"
-                ),
-                locale="uz-UZ",
-                timezone_id="Asia/Tashkent",
-                viewport={"width": 1280, "height": 800},
-            )
-            self._page = await self._context.new_page()
-
-            # Automation belgilarini yashirish
-            await self._page.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-                Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3]});
-            """)
-
-            # Saytga kirib session olish
-            await self._page.goto(self.BASE, wait_until="domcontentloaded", timeout=30000)
-            await asyncio.sleep(2)
-            self._ready = True
-            logger.info("✅ Brauzer tayyor")
-            return True
-
+            r = self._session.get(BASE, timeout=self.TIMEOUT)
+            token = self._session.cookies.get("XSRF-TOKEN", "")
+            if token:
+                self._session.headers["X-XSRF-TOKEN"] = token
+                logger.info("✅ Session va XSRF token olindi")
+            else:
+                logger.warning("XSRF token kelmadi")
         except Exception as e:
-            logger.error(f"Brauzer ishga tushmadi: {e}")
-            return False
+            logger.error(f"Session init xato: {e}")
 
-    async def stop(self):
-        """Brauzerni yopish"""
-        try:
-            if self._browser:
-                await self._browser.close()
-            if self._pw:
-                await self._pw.stop()
-        except Exception:
-            pass
+    def _throttle(self):
+        elapsed = time.time() - self._last_request
+        if elapsed < self.MIN_INTERVAL:
+            time.sleep(self.MIN_INTERVAL - elapsed)
+        self._last_request = time.time()
 
-    async def search_trains(self, from_code: str, to_code: str, date: str) -> list:
-        """
-        Poyezdlarni qidirish — brauzer orqali API ga so'rov
-        """
-        if not self._ready:
-            ok = await self.start()
-            if not ok:
-                return []
+    def search_trains(self, from_code: str, to_code: str, date: str) -> list:
+        self._throttle()
 
-        try:
-            # API ga brauzer kontekstida fetch qilish
-            result = await self._page.evaluate("""
-                async ([url, from_code, to_code, date]) => {
-                    try {
-                        const resp = await fetch(url, {
-                            method: 'POST',
-                            headers: {
-                                'Content-Type': 'application/json',
-                                'Accept': 'application/json',
-                                'Accept-Language': 'uz',
-                            },
-                            body: JSON.stringify({
-                                directions: {
-                                    forward: {
-                                        date: date,
-                                        depStationCode: from_code,
-                                        arvStationCode: to_code,
-                                    }
-                                }
-                            })
-                        });
-                        const data = await resp.json();
-                        return {ok: true, status: resp.status, data: data};
-                    } catch(e) {
-                        return {ok: false, error: e.toString()};
-                    }
+        payload = {
+            "directions": {
+                "forward": {
+                    "date": date,
+                    "depStationCode": from_code,
+                    "arvStationCode": to_code,
                 }
-            """, [self.SEARCH_URL, from_code, to_code, date])
+            }
+        }
 
-            if not result.get("ok"):
-                logger.error(f"Fetch xato: {result.get('error')}")
-                # Sessiya yangilash
-                await self._page.goto(self.BASE, wait_until="domcontentloaded", timeout=20000)
-                await asyncio.sleep(2)
+        for attempt in range(1, self.MAX_RETRIES + 1):
+            try:
+                r = self._session.post(
+                    SEARCH_URL,
+                    json=payload,
+                    timeout=self.TIMEOUT,
+                )
+
+                if r.status_code == 401:
+                    logger.info("401 — session yangilanmoqda")
+                    self._init_session()
+                    continue
+
+                if r.status_code == 403:
+                    logger.error(
+                        "403 Forbidden — proxy ishlamayapti yoki IP blokda.\n"
+                        "Railway → Variables → PROXY_URL ni tekshiring."
+                    )
+                    return []
+
+                if r.status_code == 429:
+                    wait = int(r.headers.get("Retry-After", 60))
+                    logger.warning(f"Rate limit — {wait}s kutilmoqda")
+                    time.sleep(wait)
+                    continue
+
+                r.raise_for_status()
+                data = r.json()
+
+                trains = (
+                    data.get("data", {})
+                    .get("directions", {})
+                    .get("forward", {})
+                    .get("trains", [])
+                )
+                logger.info(
+                    f"✅ {from_code}→{to_code} {date} — {len(trains)} poyezd topildi"
+                )
+                return trains
+
+            except requests.exceptions.ProxyError as e:
+                logger.error(f"Proxy xato: {e} — PROXY_URL ni tekshiring")
                 return []
 
-            if result.get("status") == 401:
-                logger.info("Sessiya yangilanmoqda...")
-                await self._page.goto(self.BASE, wait_until="domcontentloaded", timeout=20000)
-                await asyncio.sleep(2)
-                return []
+            except requests.exceptions.Timeout:
+                logger.warning(f"Timeout (urinish {attempt}/{self.MAX_RETRIES})")
+                if attempt < self.MAX_RETRIES:
+                    time.sleep(10 * attempt)
 
-            trains = (
-                result.get("data", {})
-                .get("data", {})
-                .get("directions", {})
-                .get("forward", {})
-                .get("trains", [])
-            )
+            except requests.exceptions.ConnectionError as e:
+                logger.warning(f"Ulanish xatosi: {e}")
+                if attempt < self.MAX_RETRIES:
+                    time.sleep(15)
 
-            logger.info(f"Topildi: {from_code}→{to_code} {date} — {len(trains)} poyezd")
-            return trains
+            except Exception as e:
+                logger.error(f"Search xato: {e}")
+                break
 
-        except Exception as e:
-            logger.error(f"search_trains xato: {e}")
-            self._ready = False
-            return []
-
-
-# Global client — bir marta ishga tushiriladi
-_client: Optional[RailwayClient] = None
-
-
-async def get_client() -> RailwayClient:
-    global _client
-    if _client is None:
-        _client = RailwayClient()
-        await _client.start()
-    return _client
+        return []
