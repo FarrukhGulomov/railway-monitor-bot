@@ -1,0 +1,21 @@
+# Secrets — HECH QACHON GitHub ga yuklamang
+.env
+*.key
+*.pem
+
+# Ma'lumotlar
+data.json
+bot.log
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# OS
+.DS_Store
+Thumbs.db
