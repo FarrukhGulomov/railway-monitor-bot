@@ -60,11 +60,20 @@ STATIONS = {
 }
 
 CAR_TYPES = {
-    "platskar": "🪑 Platskart",
-    "coupe": "🛏 Kupe",
-    "sv": "💺 SV",
+    "platskar": "🪑 Platskart / O'rindiqli",
+    "coupe": "🛏 Kupe / Yotoqli",
+    "sv": "💺 SV / Lyuks",
     "afrosiyob": "🚄 Afrosiyob",
     "any": "🔀 Barchasi",
+}
+
+# Tugma kodi -> saytdagi haqiqiy "type" maydonida qidiriladigan kalit so'zlar
+CAR_TYPE_KEYWORDS = {
+    "platskar": ["o'rindiq", "ўриндиқ", "platskart", "seat"],
+    "coupe": ["yotoq", "ётоқ", "kupe", "купе", "compart"],
+    "sv": ["sv", "lyuks", "люкс", "vip"],
+    "afrosiyob": ["afrosiyob", "афросиёб"],
+    "any": [],
 }
 
 db = Database()
@@ -341,28 +350,29 @@ async def _monitor_loop(uid: int, mid: str, data: dict, app):
             )
             db.increment_check(mid)
 
-            found = _find_train(trains, data["car_type"], data.get("max_price"))
+            found_trains = _find_all_trains(trains, data["car_type"], data.get("max_price"))
 
-            if found:
-                train, car, price = found
+            if found_trains:
                 link = "https://eticket.railway.uz"
-                msg = (
-                    f"🎯 *JOY TOPILDI!*\n\n"
-                    f"🚂 {train.get('type', '')} {train.get('number', '')}\n"
-                    f"⏰ {train.get('departureDate', data['date'])}\n"
-                    f"🚉 {data['from_name']} → {data['to_name']}\n"
-                    f"💺 {car.get('freeSeats', '?')} ta joy mavjud\n"
-                    f"💰 {price:,} so'm\n\n"
-                    f"👉 [Bilet sotib olish]({link})\n\n"
-                    f"_Kuzatuv ID: {mid} — to'xtatildi_"
-                )
+                lines = [f"🎯 *JOY TOPILDI! ({len(found_trains)} ta poyezd)*\n"]
+                for train, car, price in found_trains:
+                    lines.append(
+                        f"🚂 {train.get('brand', '')} {train.get('number', '')}\n"
+                        f"⏰ {train.get('departureDate', data['date'])}\n"
+                        f"💺 {car.get('freeSeats', '?')} ta joy | 💰 {price:,} so'm\n"
+                    )
+                lines.append(f"🚉 {data['from_name']} → {data['to_name']}")
+                lines.append(f"\n👉 [Bilet sotib olish]({link})")
+                lines.append(f"\n_Kuzatuv ID: {mid} — to'xtatildi_")
+                msg = "\n".join(lines)
+
                 await app.bot.send_message(
                     uid, msg,
                     parse_mode="Markdown",
                     disable_web_page_preview=True,
                 )
                 db.deactivate(mid)
-                logger.info(f"Joy topildi, monitor to'xtatildi: mid={mid}")
+                logger.info(f"Joy topildi ({len(found_trains)} ta), monitor to'xtatildi: mid={mid}")
                 return
 
         except Exception as e:
@@ -374,19 +384,43 @@ async def _monitor_loop(uid: int, mid: str, data: dict, app):
 
 
 def _find_train(trains: list, car_type: str, max_price=None):
+    keywords = CAR_TYPE_KEYWORDS.get(car_type, [])
     for train in trains:
         for car in train.get("cars", []):
             if car.get("freeSeats", 0) <= 0:
                 continue
-            if car_type != "any":
+            if keywords:
                 ctype = car.get("type", "").lower()
-                if car_type not in ctype:
+                if not any(kw in ctype for kw in keywords):
                     continue
             for tariff in car.get("tariffs", []):
                 price = tariff.get("tariff", 0)
                 if max_price is None or price <= max_price:
                     return (train, car, price)
     return None
+
+
+def _find_all_trains(trains: list, car_type: str, max_price=None):
+    """Mos keladigan barcha poyezd/vagon/narx kombinatsiyalarini qaytaradi"""
+    keywords = CAR_TYPE_KEYWORDS.get(car_type, [])
+    results = []
+    for train in trains:
+        for car in train.get("cars", []):
+            if car.get("freeSeats", 0) <= 0:
+                continue
+            if keywords:
+                ctype = car.get("type", "").lower()
+                if not any(kw in ctype for kw in keywords):
+                    continue
+            best_price = None
+            for tariff in car.get("tariffs", []):
+                price = tariff.get("tariff", 0)
+                if max_price is None or price <= max_price:
+                    if best_price is None or price < best_price:
+                        best_price = price
+            if best_price is not None:
+                results.append((train, car, best_price))
+    return results
 
 
 # ─── /list ─────────────────────────────────────────────────────────────────────
