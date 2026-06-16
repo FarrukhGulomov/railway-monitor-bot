@@ -44,25 +44,55 @@ class RailwayClient:
 
     def _init_session(self):
         try:
-            # Real brauzer xuddi shu sahifaga kiradi: /uz/home
             r = self._session.get(f"{BASE}/uz/home", timeout=self.TIMEOUT)
             logger.info(f"Session init status: {r.status_code}")
             logger.info(f"Cookies after /uz/home: {list(self._session.cookies.keys())}")
 
-            set_cookie = r.headers.get("set-cookie", "")
-            if set_cookie:
-                logger.info(f"Raw Set-Cookie: {set_cookie[:200]}")
-
+            # curl_cffi ba'zan Set-Cookie ni avtomatik jar'ga qo'shmaydi —
+            # headerdan qo'lda o'qib olamiz
             token = self._find_xsrf_token()
+
+            if not token:
+                token = self._extract_token_from_headers(r)
 
             if token:
                 self._session.headers["X-Xsrf-Token"] = token
+                # cookie sifatida ham qo'shamiz — keyingi so'rovlarda kerak bo'lishi mumkin
+                self._session.cookies.set("XSRF-TOKEN", token, domain="eticket.railway.uz")
                 logger.info(f"✅ XSRF token olindi: {token[:15]}...")
             else:
                 logger.warning(f"XSRF token kelmadi. Mavjud cookielar: {list(self._session.cookies.keys())}")
+                # Barcha raw headerlarni ko'rsatish — debug uchun
+                try:
+                    raw_headers = r.headers.multi_items() if hasattr(r.headers, "multi_items") else list(r.headers.items())
+                    cookie_headers = [h for h in raw_headers if h[0].lower() == "set-cookie"]
+                    logger.info(f"Raw set-cookie headerlar soni: {len(cookie_headers)}")
+                    for h in cookie_headers:
+                        logger.info(f"  -> {h[1][:150]}")
+                except Exception as e:
+                    logger.warning(f"Header tekshirishda xato: {e}")
 
         except Exception as e:
             logger.error(f"Session init xato: {e}")
+
+    def _extract_token_from_headers(self, response) -> str:
+        """Set-Cookie headerlardan to'g'ridan-to'g'ri XSRF-TOKEN qiymatini ajratib olish"""
+        try:
+            raw_headers = (
+                response.headers.multi_items()
+                if hasattr(response.headers, "multi_items")
+                else list(response.headers.items())
+            )
+            for name, value in raw_headers:
+                if name.lower() == "set-cookie" and "XSRF-TOKEN" in value:
+                    # format: XSRF-TOKEN=xxxxx; Path=/; ...
+                    part = value.split("XSRF-TOKEN=", 1)[1]
+                    token = part.split(";")[0].strip()
+                    from urllib.parse import unquote
+                    return unquote(token)
+        except Exception as e:
+            logger.warning(f"Header parse xato: {e}")
+        return ""
 
     def _find_xsrf_token(self) -> str:
         """Turli nomdagi CSRF cookie larni qidirish"""
