@@ -19,7 +19,8 @@ HEADERS = {
     "Content-Type": "application/json",
     "Accept-Language": "uz",
     "Origin": BASE,
-    "Referer": f"{BASE}/",
+    "Referer": f"{BASE}/uz/home",
+    "Device-Type": "BROWSER",
 }
 
 
@@ -43,29 +44,19 @@ class RailwayClient:
 
     def _init_session(self):
         try:
-            # 1. Bosh sahifaga kirish — ba'zi cookielarni o'rnatadi
-            r = self._session.get(BASE, timeout=self.TIMEOUT)
+            # Real brauzer xuddi shu sahifaga kiradi: /uz/home
+            r = self._session.get(f"{BASE}/uz/home", timeout=self.TIMEOUT)
             logger.info(f"Session init status: {r.status_code}")
-            logger.info(f"Cookies after /: {list(self._session.cookies.keys())}")
+            logger.info(f"Cookies after /uz/home: {list(self._session.cookies.keys())}")
 
-            # 2. Token barcha mumkin bo'lgan nomlar bilan tekshirish
+            set_cookie = r.headers.get("set-cookie", "")
+            if set_cookie:
+                logger.info(f"Raw Set-Cookie: {set_cookie[:200]}")
+
             token = self._find_xsrf_token()
 
-            # 3. Agar topilmasa — ko'pincha SPA app uchun maxsus
-            #    "bootstrap" endpointni chaqirish kerak bo'ladi
-            if not token:
-                for path in ("/api/v1/init", "/api/v3/init", "/sanctum/csrf-cookie", "/api/csrf"):
-                    try:
-                        r2 = self._session.get(BASE + path, timeout=10)
-                        logger.info(f"Sinov {path}: {r2.status_code}, cookies: {list(self._session.cookies.keys())}")
-                        token = self._find_xsrf_token()
-                        if token:
-                            break
-                    except Exception:
-                        continue
-
             if token:
-                self._session.headers["X-XSRF-TOKEN"] = token
+                self._session.headers["X-Xsrf-Token"] = token
                 logger.info(f"✅ XSRF token olindi: {token[:15]}...")
             else:
                 logger.warning(f"XSRF token kelmadi. Mavjud cookielar: {list(self._session.cookies.keys())}")
