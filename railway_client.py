@@ -43,16 +43,47 @@ class RailwayClient:
 
     def _init_session(self):
         try:
+            # 1. Bosh sahifaga kirish — ba'zi cookielarni o'rnatadi
             r = self._session.get(BASE, timeout=self.TIMEOUT)
             logger.info(f"Session init status: {r.status_code}")
-            token = self._session.cookies.get("XSRF-TOKEN", "")
+            logger.info(f"Cookies after /: {list(self._session.cookies.keys())}")
+
+            # 2. Token barcha mumkin bo'lgan nomlar bilan tekshirish
+            token = self._find_xsrf_token()
+
+            # 3. Agar topilmasa — ko'pincha SPA app uchun maxsus
+            #    "bootstrap" endpointni chaqirish kerak bo'ladi
+            if not token:
+                for path in ("/api/v1/init", "/api/v3/init", "/sanctum/csrf-cookie", "/api/csrf"):
+                    try:
+                        r2 = self._session.get(BASE + path, timeout=10)
+                        logger.info(f"Sinov {path}: {r2.status_code}, cookies: {list(self._session.cookies.keys())}")
+                        token = self._find_xsrf_token()
+                        if token:
+                            break
+                    except Exception:
+                        continue
+
             if token:
                 self._session.headers["X-XSRF-TOKEN"] = token
-                logger.info("✅ XSRF token olindi")
+                logger.info(f"✅ XSRF token olindi: {token[:15]}...")
             else:
-                logger.warning("XSRF token kelmadi (ehtimol kerak emas)")
+                logger.warning(f"XSRF token kelmadi. Mavjud cookielar: {list(self._session.cookies.keys())}")
+
         except Exception as e:
             logger.error(f"Session init xato: {e}")
+
+    def _find_xsrf_token(self) -> str:
+        """Turli nomdagi CSRF cookie larni qidirish"""
+        for name in ("XSRF-TOKEN", "csrf_token", "CSRF-TOKEN", "_csrf", "csrftoken", "X-CSRF-TOKEN"):
+            val = self._session.cookies.get(name, "")
+            if val:
+                try:
+                    from urllib.parse import unquote
+                    return unquote(val)
+                except Exception:
+                    return val
+        return ""
 
     def _throttle(self):
         elapsed = time.time() - self._last_request
@@ -90,6 +121,11 @@ class RailwayClient:
 
                 if r.status_code == 403:
                     logger.error(f"403 Forbidden. Body: {r.text[:300]}")
+                    if "CSRF" in r.text and attempt < self.MAX_RETRIES:
+                        logger.info("CSRF xato — session butunlay yangilanmoqda")
+                        self._session.cookies.clear()
+                        self._init_session()
+                        continue
                     return []
 
                 if r.status_code == 429:
