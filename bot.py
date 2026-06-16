@@ -404,22 +404,42 @@ def _find_all_trains(trains: list, car_type: str, max_price=None):
     """Mos keladigan barcha poyezd/vagon/narx kombinatsiyalarini qaytaradi"""
     keywords = CAR_TYPE_KEYWORDS.get(car_type, [])
     results = []
+    logger.info(f"Filtr: car_type={car_type}, keywords={keywords}, max_price={max_price}, jami poyezd={len(trains)}")
+
     for train in trains:
-        for car in train.get("cars", []):
-            if car.get("freeSeats", 0) <= 0:
+        cars = train.get("cars", [])
+        if not cars:
+            logger.info(f"  ⏭ {train.get('brand')} {train.get('number')} — cars bo'sh")
+            continue
+
+        for car in cars:
+            free = car.get("freeSeats", 0)
+            ctype_raw = car.get("type", "")
+            if free <= 0:
+                logger.info(f"  ⏭ {train.get('number')} [{ctype_raw}] — joy yo'q ({free})")
                 continue
+
             if keywords:
-                ctype = car.get("type", "").lower()
+                ctype = ctype_raw.lower()
                 if not any(kw in ctype for kw in keywords):
+                    logger.info(f"  ⏭ {train.get('number')} [{ctype_raw}] — vagon turi mos kelmadi")
                     continue
+
             best_price = None
+            all_prices = [t.get("tariff", 0) for t in car.get("tariffs", [])]
             for tariff in car.get("tariffs", []):
                 price = tariff.get("tariff", 0)
                 if max_price is None or price <= max_price:
                     if best_price is None or price < best_price:
                         best_price = price
-            if best_price is not None:
-                results.append((train, car, best_price))
+
+            if best_price is None:
+                logger.info(f"  ⏭ {train.get('number')} [{ctype_raw}] — narxlar {all_prices} max_price={max_price} dan baland")
+                continue
+
+            logger.info(f"  ✅ {train.get('number')} [{ctype_raw}] — {free} joy, {best_price} so'm")
+            results.append((train, car, best_price))
+
     return results
 
 
