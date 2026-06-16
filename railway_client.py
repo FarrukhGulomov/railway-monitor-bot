@@ -48,29 +48,22 @@ class RailwayClient:
             logger.info(f"Session init status: {r.status_code}")
             logger.info(f"Cookies after /uz/home: {list(self._session.cookies.keys())}")
 
-            # curl_cffi ba'zan Set-Cookie ni avtomatik jar'ga qo'shmaydi —
-            # headerdan qo'lda o'qib olamiz
             token = self._find_xsrf_token()
 
             if not token:
                 token = self._extract_token_from_headers(r)
 
-            if token:
-                self._session.headers["X-Xsrf-Token"] = token
-                # cookie sifatida ham qo'shamiz — keyingi so'rovlarda kerak bo'lishi mumkin
-                self._session.cookies.set("XSRF-TOKEN", token, domain="eticket.railway.uz")
-                logger.info(f"✅ XSRF token olindi: {token[:15]}...")
-            else:
-                logger.warning(f"XSRF token kelmadi. Mavjud cookielar: {list(self._session.cookies.keys())}")
-                # Barcha raw headerlarni ko'rsatish — debug uchun
-                try:
-                    raw_headers = r.headers.multi_items() if hasattr(r.headers, "multi_items") else list(r.headers.items())
-                    cookie_headers = [h for h in raw_headers if h[0].lower() == "set-cookie"]
-                    logger.info(f"Raw set-cookie headerlar soni: {len(cookie_headers)}")
-                    for h in cookie_headers:
-                        logger.info(f"  -> {h[1][:150]}")
-                except Exception as e:
-                    logger.warning(f"Header tekshirishda xato: {e}")
+            if not token:
+                # Double-submit CSRF pattern: ko'p tizimlarda server tokenni
+                # o'zi generatsiya qilmaydi, faqat cookie==header tekshiradi.
+                # Shu sababli o'zimiz UUID generatsiya qilib yuboramiz.
+                import uuid
+                token = str(uuid.uuid4())
+                logger.info(f"XSRF token serverdan kelmadi — o'zimiz generatsiya qildik: {token}")
+
+            self._session.headers["X-Xsrf-Token"] = token
+            self._session.cookies.set("XSRF-TOKEN", token, domain="eticket.railway.uz")
+            logger.info(f"✅ XSRF token o'rnatildi: {token[:15]}...")
 
         except Exception as e:
             logger.error(f"Session init xato: {e}")
