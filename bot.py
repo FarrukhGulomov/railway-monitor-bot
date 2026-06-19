@@ -489,24 +489,32 @@ async def _monitor_loop(uid: int, mid: str, data: dict, app):
             if found:
                 link = "https://eticket.railway.uz"
                 if first_run:
-                    header = f"📋 *Hozirda mavjud biletlar ({len(found)} ta):*\n"
+                    header = f"📋 *Hozirda mavjud biletlar ({len(found)} ta variant):*\n"
                 else:
-                    header = f"🎯 *Yangi joy topildi! ({len(found)} ta poyezd)*\n"
+                    header = f"🎯 *Yangi joy topildi! ({len(found)} ta variant)*\n"
 
                 lines = [header]
-                for train, car, price in found:
+                prev_number = None
+                for train, car, price, tariff_seats, service_type in found:
                     dep = train.get("departureDate", "")
                     arr = train.get("arrivalDate", "")
-                    time_str = ""
-                    if dep:
-                        parts = dep.split(" ")
-                        time_str = parts[1] if len(parts) > 1 else dep
+                    number = train.get("number", "")
+                    time_str = dep.split(" ")[1] if " " in dep else dep
+                    arr_str = arr.split(" ")[1] if " " in arr else arr
+
+                    # Poyezd sarlavhasini faqat bir marta ko'rsatish
+                    if number != prev_number:
+                        lines.append(
+                            f"🚂 *{train.get('brand', '')} {number}*\n"
+                            f"   ⏰ {time_str} → {arr_str}"
+                        )
+                        prev_number = number
+
                     lines.append(
-                        f"🚂 *{train.get('brand', '')} {train.get('number', '')}*\n"
-                        f"   ⏰ {time_str} → {arr.split(' ')[1] if arr and ' ' in arr else ''}\n"
-                        f"   💺 {car.get('freeSeats', '?')} joy | 💰 {price:,} so'm\n"
+                        f"   💺 {service_type}: {tariff_seats} joy | 💰 {price:,} so'm"
                     )
-                lines.append(f"🚉 {data['from_name']} → {data['to_name']}")
+
+                lines.append(f"\n🚉 {data['from_name']} → {data['to_name']}")
                 lines.append(f"\n👉 [Bilet sotib olish]({link})")
 
                 if not first_run:
@@ -611,18 +619,19 @@ def _find_all_trains(trains, car_type, max_price=None, time_from="00:00", time_t
                     logger.info(f"  ⏭ {number} [{ctype_raw}] — tur mos kelmadi")
                     continue
 
-            best_price = None
+            # Har bir tariffni alohida ko'rsatish
             for tariff in car.get("tariffs", []):
                 price = tariff.get("tariff", 0)
-                if max_price is None or price <= max_price:
-                    if best_price is None or price < best_price:
-                        best_price = price
+                tariff_seats = tariff.get("freeSeats", free)
+                service_type = tariff.get("classServiceType", "")
 
-            if best_price is None:
-                continue
+                if max_price is not None and price > max_price:
+                    continue
+                if tariff_seats <= 0:
+                    continue
 
-            logger.info(f"  ✅ {number} [{ctype_raw}] {dep} — {free} joy, {best_price:,} so'm")
-            results.append((train, car, best_price))
+                logger.info(f"  ✅ {number} [{ctype_raw}/{service_type}] {dep} — {tariff_seats} joy, {price:,} so'm")
+                results.append((train, car, price, tariff_seats, service_type))
 
     return results
 
