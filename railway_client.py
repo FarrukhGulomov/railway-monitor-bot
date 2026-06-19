@@ -177,8 +177,6 @@ class RailwayClient:
     def _fill_empty_cars(self, trains: list, from_code: str, to_code: str, date: str) -> list:
         """
         Cars bo'sh bo'lgan poyezdlar uchun alohida so'rov yuboradi.
-        Ko'p hollarda sayt trains/list da cars ni to'liq qaytarmaydi —
-        poyezd bosilganda alohida so'rov bilan yuklanadi.
         """
         empty = [t for t in trains if not t.get("cars")]
         if not empty:
@@ -188,45 +186,89 @@ class RailwayClient:
 
         for train in empty:
             number = train.get("number", "")
-            dep_date = train.get("departureDate", "").split(" ")[0]
+            dep_date = train.get("departureDate", "")
+            # "19.06.2026 19:48" -> "2026-06-19"
             if dep_date and "." in dep_date:
-                # Format: "19.06.2026" -> "2026-06-19"
-                parts = dep_date.split(".")
+                parts = dep_date.split(" ")[0].split(".")
                 if len(parts) == 3:
-                    dep_date = f"{parts[2]}-{parts[1]}-{parts[0]}"
+                    dep_date_iso = f"{parts[2]}-{parts[1]}-{parts[0]}"
+                else:
+                    dep_date_iso = date
+            else:
+                dep_date_iso = date
 
-            try:
-                # Variant 1: raqam orqali poyezd cars ni olish
-                r = self._session.post(
-                    f"{BASE}/api/v3/handbook/trains/list",
-                    json={
-                        "directions": {
-                            "forward": {
-                                "date": date,
-                                "depStationCode": from_code,
-                                "arvStationCode": to_code,
-                                "trainNumber": number,
-                            }
-                        }
-                    },
-                    timeout=self.TIMEOUT,
-                )
-                if r.status_code == 200:
-                    detail_trains = (
-                        r.json().get("data", {})
-                        .get("directions", {})
-                        .get("forward", {})
-                        .get("trains", [])
-                    )
-                    for dt in detail_trains:
-                        if dt.get("number") == number and dt.get("cars"):
-                            train["cars"] = dt["cars"]
-                            logger.info(f"  ✅ {number} uchun {len(dt['cars'])} vagon olindi")
-                            break
-                    else:
-                        logger.info(f"  ⚠️ {number} uchun trainNumber filter ishlamadi")
+            # Variant 1: faqat train raqami bilan filterlab qayta so'rov
+            cars = self._try_get_cars_v1(number, from_code, to_code, dep_date_iso)
 
-            except Exception as e:
-                logger.warning(f"  {number} cars olishda xato: {e}")
+            # Variant 2: departure time bilan
+            if not cars:
+                dep_time = dep_date.split(" ")[1] if " " in dep_date else ""
+                cars = self._try_get_cars_v2(number, dep_time, from_code, to_code, dep_date_iso)
+
+            if cars:
+                train["cars"] = cars
+                logger.info(f"  ✅ {number} uchun {len(cars)} vagon olindi")
+            else:
+                logger.info(f"  ⚠️ {number} uchun cars olinmadi (saytda ham yo'q bo'lishi mumkin)")
 
         return trains
+
+    def _try_get_cars_v1(self, number: str, from_code: str, to_code: str, date: str) -> list:
+        """departure date bilan to'liq qidiruv — ba'zan boshqa sanada bilet chiqadi"""
+        try:
+            r = self._session.post(
+                SEARCH_URL,
+                json={
+                    "directions": {
+                        "forward": {
+                            "date": date,
+                            "depStationCode": from_code,
+                            "arvStationCode": to_code,
+                        }
+                    }
+                },
+                timeout=self.TIMEOUT,
+            )
+            if r.status_code == 200:
+                detail_trains = (
+                    r.json().get("data", {})
+                    .get("directions", {})
+                    .get("forward", {})
+                    .get("trains", [])
+                )
+                for dt in detail_trains:
+                    if dt.get("number") == number and dt.get("cars"):
+                        return dt["cars"]
+        except Exception as e:
+            logger.warning(f"  v1 xato: {e}")
+        return []
+
+    def _try_get_cars_v2(self, number: str, dep_time: str, from_code: str, to_code: str, date: str) -> list:
+        """Poyezd uchun maxsus endpoint sinab ko'rish"""
+        endpoints = [
+            f"{BASE}/api/v3/handbook/trains/{number}/cars",
+            f"{BASE}/api/v3/handbook/trains/cars",
+            f"{BASE}/api/v3/handbook/train-cars",
+        ]
+        payloads = [
+            {"trainNumber": number, "date": date, "depStationCode": from_code, "arvStationCode": to_code},
+            {"number": number, "date": date, "from": from_code, "to": to_code},
+            {"train": number, "date": date, "departureTime": dep_time},
+        ]
+        for url, payload in zip(endpoints, payloads):
+            try:
+                r = self._session.post(url, json=payload, timeout=10)
+                if r.status_code == 200:
+                    data = r.json()
+                    # Turli formatda qaytishi mumkin
+                    cars = (
+                        data.get("data", {}).get("cars") or
+                        data.get("data", []) or
+                        data.get("cars", [])
+                    )
+                    if cars and isinstance(cars, list):
+                        logger.info(f"  ✅ v2 endpoint ishladi: {url}")
+                        return cars
+            except Exception:
+                continue
+        return []
