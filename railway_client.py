@@ -123,15 +123,26 @@ class RailwayClient:
                 if r.status_code == 400:
                     error_body = r.text[:200]
                     logger.error(f"400 Bad Request: {error_body}")
+
+                    if "Express" in error_body or "ma'lumot kelmadi" in error_body:
+                        # Bu railway.uz serverining ICHKI vaqtinchalik xatosi —
+                        # bizning so'rovimiz to'g'ri, lekin ularning Express
+                        # (tezyurar poyezdlar) xizmati javob bermayapti.
+                        # Session yangilash foydasiz — shunchaki biroz kutib qayta uriniladi.
+                        logger.warning(
+                            "Sayt backendi vaqtincha javob bermayapti "
+                            "(Express xizmati). Keyingi tsiklda qayta sinab ko'riladi."
+                        )
+                        return []
+
                     if "Unexpected status" in error_body:
-                        # Bu odatda sana muammosi — masalan, o'sha kun uchun
-                        # barcha reyslar allaqachon jo'nab ketgan
                         logger.warning(
                             f"Sayt bu sanani ({date}) qabul qilmayapti. "
                             "Sabab: barcha reyslar o'tib ketgan bo'lishi yoki "
                             "sana formatida muammo bo'lishi mumkin."
                         )
                         return []
+
                     self._init_session()
                     continue
 

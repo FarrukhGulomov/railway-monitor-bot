@@ -703,23 +703,22 @@ async def _monitor_loop(uid: int, mid: str, data: dict, app):
             )
             db.increment_check(mid)
 
-            # Agar sayt doimiy 400/bo'sh natija qaytarsa (masalan bugungi
-            # kun uchun barcha reyslar o'tib ketgan bo'lsa) — ogohlantirish
+            # Agar sayt doimiy bo'sh natija qaytarsa (sana o'tib ketgan yoki
+            # sayt backend xizmati vaqtincha ishlamayotgan bo'lishi mumkin)
             if not trains:
                 consecutive_empty_date_errors += 1
                 if consecutive_empty_date_errors == 10:
                     mon_date_str = data.get("date", "")
-                    is_today = mon_date_str == datetime.now().strftime("%Y-%m-%d")
-                    if is_today:
-                        await app.bot.send_message(
-                            uid,
-                            f"⚠️ Diqqat: 10 marta ketma-ket natija kelmadi.\n"
-                            f"Ehtimol bugungi ({mon_date_str}) kun uchun barcha "
-                            f"reyslar allaqachon jo'nab ketgan.\n\n"
-                            f"Sanani ertangi kunga o'zgartirishni xohlasangiz "
-                            f"/list orqali tahrirlang.\n🆔 `{mid}`",
-                            parse_mode="Markdown",
-                        )
+                    await app.bot.send_message(
+                        uid,
+                        f"⚠️ Diqqat: 10 marta ketma-ket natija kelmadi.\n"
+                        f"Ehtimol railway.uz sayti vaqtincha javob bermayapti, "
+                        f"yoki {mon_date_str} sanasi uchun reyslar tugagan.\n\n"
+                        f"Kuzatuv davom etadi — agar sayt tiklansa, "
+                        f"avtomatik aniqlanadi.\n🆔 `{mid}`",
+                        parse_mode="Markdown",
+                    )
+                    consecutive_empty_date_errors = 0  # qayta ogohlantirish uchun reset
             else:
                 consecutive_empty_date_errors = 0
 
