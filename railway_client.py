@@ -121,7 +121,17 @@ class RailwayClient:
                     return []
 
                 if r.status_code == 400:
-                    logger.error(f"400 Bad Request: {r.text[:200]}")
+                    error_body = r.text[:200]
+                    logger.error(f"400 Bad Request: {error_body}")
+                    if "Unexpected status" in error_body:
+                        # Bu odatda sana muammosi — masalan, o'sha kun uchun
+                        # barcha reyslar allaqachon jo'nab ketgan
+                        logger.warning(
+                            f"Sayt bu sanani ({date}) qabul qilmayapti. "
+                            "Sabab: barcha reyslar o'tib ketgan bo'lishi yoki "
+                            "sana formatida muammo bo'lishi mumkin."
+                        )
+                        return []
                     self._init_session()
                     continue
 

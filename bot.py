@@ -670,9 +670,26 @@ async def _monitor_loop(uid: int, mid: str, data: dict, app):
     client = await asyncio.to_thread(RailwayClient)
     logger.info(f"Monitor boshlandi: uid={uid} mid={mid}")
     first_run = True
+    consecutive_empty_date_errors = 0
 
     while db.is_active(mid):
         try:
+            # Sana o'tib ketganmi tekshirish
+            try:
+                mon_date = datetime.strptime(data["date"], "%Y-%m-%d").date()
+                if mon_date < datetime.now().date():
+                    await app.bot.send_message(
+                        uid,
+                        f"⚠️ Kuzatuv to'xtatildi — sana ({data['date']}) o'tib ketdi.\n"
+                        f"🆔 `{mid}`",
+                        parse_mode="Markdown",
+                    )
+                    db.deactivate(mid)
+                    logger.info(f"Sana o'tib ketgani uchun to'xtatildi: mid={mid}")
+                    return
+            except ValueError:
+                pass
+
             # DB dan yangi ma'lumotlarni olish (tahrirlangan bo'lishi mumkin)
             monitors = db.get_active_monitors(uid)
             current = next((m for m in monitors if m["id"] == mid), None)
@@ -685,6 +702,26 @@ async def _monitor_loop(uid: int, mid: str, data: dict, app):
                 client.search_trains, data["from_code"], data["to_code"], data["date"]
             )
             db.increment_check(mid)
+
+            # Agar sayt doimiy 400/bo'sh natija qaytarsa (masalan bugungi
+            # kun uchun barcha reyslar o'tib ketgan bo'lsa) — ogohlantirish
+            if not trains:
+                consecutive_empty_date_errors += 1
+                if consecutive_empty_date_errors == 10:
+                    mon_date_str = data.get("date", "")
+                    is_today = mon_date_str == datetime.now().strftime("%Y-%m-%d")
+                    if is_today:
+                        await app.bot.send_message(
+                            uid,
+                            f"⚠️ Diqqat: 10 marta ketma-ket natija kelmadi.\n"
+                            f"Ehtimol bugungi ({mon_date_str}) kun uchun barcha "
+                            f"reyslar allaqachon jo'nab ketgan.\n\n"
+                            f"Sanani ertangi kunga o'zgartirishni xohlasangiz "
+                            f"/list orqali tahrirlang.\n🆔 `{mid}`",
+                            parse_mode="Markdown",
+                        )
+            else:
+                consecutive_empty_date_errors = 0
 
             found = _find_all_trains(
                 trains, data["car_type"], data.get("max_price"),
