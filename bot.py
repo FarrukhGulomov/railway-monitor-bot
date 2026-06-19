@@ -60,6 +60,7 @@ CAR_TYPES = {
     "coupe":     "🛏 Kupe",
     "sv":        "💺 SV / Lyuks",
     "afrosiyob": "🚄 Afrosiyob",
+    "sharq":     "🚅 Sharq",
     "any":       "🔀 Barchasi",
 }
 
@@ -68,8 +69,16 @@ CAR_TYPE_KEYWORDS = {
     "coupe":     ["yotoq", "ётоқ", "kupe", "купе", "compart"],
     "sv":        ["sv", "lyuks", "люкс", "vip"],
     "afrosiyob": [],
+    "sharq":     [],
     "any":       [],
 }
+
+# Brand orqali filtrlanadigan turlar (vagon type emas, poyezd brendi tekshiriladi)
+BRAND_FILTERS = {
+    "afrosiyob": ["afrosiyob", "афросиёб"],
+    "sharq":     ["sharq", "шарк", "шарқ"],
+}
+
 
 TIME_RANGES = {
     "any":     ("00:00", "23:59", "🕐 Istalgan vaqt"),
@@ -311,7 +320,8 @@ async def cal_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
              InlineKeyboardButton("🛏 Kupe", callback_data="car|coupe")],
             [InlineKeyboardButton("💺 SV", callback_data="car|sv"),
              InlineKeyboardButton("🚄 Afrosiyob", callback_data="car|afrosiyob")],
-            [InlineKeyboardButton("🔀 Barchasi", callback_data="car|any")],
+            [InlineKeyboardButton("🚅 Sharq", callback_data="car|sharq"),
+             InlineKeyboardButton("🔀 Barchasi", callback_data="car|any")],
         ]),
         parse_mode="Markdown",
     )
@@ -540,7 +550,8 @@ async def mgr_edit_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
                  InlineKeyboardButton("🛏 Kupe",      callback_data="mgr_cv|coupe")],
                 [InlineKeyboardButton("💺 SV",        callback_data="mgr_cv|sv"),
                  InlineKeyboardButton("🚄 Afrosiyob", callback_data="mgr_cv|afrosiyob")],
-                [InlineKeyboardButton("🔀 Barchasi",  callback_data="mgr_cv|any")],
+                [InlineKeyboardButton("🚅 Sharq",     callback_data="mgr_cv|sharq"),
+                 InlineKeyboardButton("🔀 Barchasi",  callback_data="mgr_cv|any")],
             ]),
         )
     elif field == "price":
@@ -745,8 +756,8 @@ def _time_in_range(dep_date_str: str, t_from: str, t_to: str) -> bool:
 
 
 def _find_all_trains(trains, car_type, max_price=None, time_from="00:00", time_to="23:59"):
-    keywords   = CAR_TYPE_KEYWORDS.get(car_type, [])
-    check_brand = car_type == "afrosiyob"
+    keywords    = CAR_TYPE_KEYWORDS.get(car_type, [])
+    brand_kws   = BRAND_FILTERS.get(car_type)  # None bo'lsa brand filtri yo'q
     results = []
     logger.info(f"Filtr: car_type={car_type}, vaqt={time_from}–{time_to}, max_price={max_price}, jami={len(trains)}")
 
@@ -759,8 +770,8 @@ def _find_all_trains(trains, car_type, max_price=None, time_from="00:00", time_t
             logger.info(f"  ⏭ {number} — vaqt {dep} oralig'dan tashqarida")
             continue
 
-        if check_brand and "afrosiyob" not in brand and "афросиёб" not in brand:
-            logger.info(f"  ⏭ {number} [{train.get('brand')}] — Afrosiyob emas")
+        if brand_kws and not any(kw in brand for kw in brand_kws):
+            logger.info(f"  ⏭ {number} [{train.get('brand')}] — {CAR_TYPES.get(car_type)} emas")
             continue
 
         cars = train.get("cars", [])
@@ -773,7 +784,7 @@ def _find_all_trains(trains, car_type, max_price=None, time_from="00:00", time_t
             ctype_raw = car.get("type", "")
             if free <= 0:
                 continue
-            if keywords and not check_brand:
+            if keywords and not brand_kws:
                 if not any(kw in ctype_raw.lower() for kw in keywords):
                     logger.info(f"  ⏭ {number} [{ctype_raw}] — tur mos kelmadi")
                     continue
