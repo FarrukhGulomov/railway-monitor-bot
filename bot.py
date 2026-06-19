@@ -573,20 +573,29 @@ def _time_in_range(dep_date_str: str, t_from: str, t_to: str) -> bool:
 
 def _find_all_trains(trains, car_type, max_price=None, time_from="00:00", time_to="23:59"):
     keywords = CAR_TYPE_KEYWORDS.get(car_type, [])
+    check_brand = car_type == "afrosiyob"  # Afrosiyob uchun brand tekshiriladi
     results = []
     logger.info(f"Filtr: car_type={car_type}, vaqt={time_from}–{time_to}, max_price={max_price}, jami={len(trains)}")
 
     for train in trains:
         dep = train.get("departureDate", "")
+        brand = train.get("brand", "").lower()
+        number = train.get("number", "")
 
         # Vaqt oralig'i filtri
         if not _time_in_range(dep, time_from, time_to):
-            logger.info(f"  ⏭ {train.get('number')} — vaqt {dep} oralig'dan tashqarida")
+            logger.info(f"  ⏭ {number} — vaqt {dep} oralig'dan tashqarida")
             continue
+
+        # Afrosiyob uchun: brand maydonini tekshirish
+        if check_brand:
+            if "afrosiyob" not in brand and "афросиёб" not in brand:
+                logger.info(f"  ⏭ {number} [{train.get('brand')}] — Afrosiyob emas")
+                continue
 
         cars = train.get("cars", [])
         if not cars:
-            logger.info(f"  ⏭ {train.get('brand')} {train.get('number')} — cars bo'sh")
+            logger.info(f"  ⏭ {train.get('brand')} {number} — cars bo'sh")
             continue
 
         for car in cars:
@@ -596,9 +605,10 @@ def _find_all_trains(trains, car_type, max_price=None, time_from="00:00", time_t
             if free <= 0:
                 continue
 
-            if keywords:
+            # Afrosiyob emas, boshqa turlar uchun vagon type filtri
+            if keywords and not check_brand:
                 if not any(kw in ctype_raw.lower() for kw in keywords):
-                    logger.info(f"  ⏭ {train.get('number')} [{ctype_raw}] — tur mos kelmadi")
+                    logger.info(f"  ⏭ {number} [{ctype_raw}] — tur mos kelmadi")
                     continue
 
             best_price = None
@@ -611,7 +621,7 @@ def _find_all_trains(trains, car_type, max_price=None, time_from="00:00", time_t
             if best_price is None:
                 continue
 
-            logger.info(f"  ✅ {train.get('number')} [{ctype_raw}] {dep} — {free} joy, {best_price:,} so'm")
+            logger.info(f"  ✅ {number} [{ctype_raw}] {dep} — {free} joy, {best_price:,} so'm")
             results.append((train, car, best_price))
 
     return results
