@@ -783,6 +783,7 @@ def _find_all_trains(trains, car_type, max_price=None, time_from="00:00", time_t
                 tariff_seats  = tariff.get("freeSeats", free)
                 service_type  = tariff.get("classServiceType", ctype_raw)
                 if max_price is not None and price > max_price:
+                    logger.info(f"  ⏭ {number} [{service_type}] — narx {price:,} > maks {max_price:,}")
                     continue
                 if tariff_seats <= 0:
                     continue
