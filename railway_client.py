@@ -159,6 +159,9 @@ class RailwayClient:
                     .get("forward", {})
                     .get("trains", [])
                 )
+
+                # cars bo'sh bo'lgan poyezdlar uchun alohida so'rov
+                trains = self._fill_empty_cars(trains, from_code, to_code, date)
                 logger.info(
                     f"✅ {from_code}→{to_code} {date} — {len(trains)} poyezd topildi"
                 )
@@ -170,3 +173,60 @@ class RailwayClient:
                     time.sleep(10)
 
         return []
+
+    def _fill_empty_cars(self, trains: list, from_code: str, to_code: str, date: str) -> list:
+        """
+        Cars bo'sh bo'lgan poyezdlar uchun alohida so'rov yuboradi.
+        Ko'p hollarda sayt trains/list da cars ni to'liq qaytarmaydi —
+        poyezd bosilganda alohida so'rov bilan yuklanadi.
+        """
+        empty = [t for t in trains if not t.get("cars")]
+        if not empty:
+            return trains
+
+        logger.info(f"Cars bo'sh poyezdlar: {len(empty)} ta — alohida so'rov yuborilmoqda")
+
+        for train in empty:
+            number = train.get("number", "")
+            dep_date = train.get("departureDate", "").split(" ")[0]
+            if dep_date and "." in dep_date:
+                # Format: "19.06.2026" -> "2026-06-19"
+                parts = dep_date.split(".")
+                if len(parts) == 3:
+                    dep_date = f"{parts[2]}-{parts[1]}-{parts[0]}"
+
+            try:
+                # Variant 1: raqam orqali poyezd cars ni olish
+                r = self._session.post(
+                    f"{BASE}/api/v3/handbook/trains/list",
+                    json={
+                        "directions": {
+                            "forward": {
+                                "date": date,
+                                "depStationCode": from_code,
+                                "arvStationCode": to_code,
+                                "trainNumber": number,
+                            }
+                        }
+                    },
+                    timeout=self.TIMEOUT,
+                )
+                if r.status_code == 200:
+                    detail_trains = (
+                        r.json().get("data", {})
+                        .get("directions", {})
+                        .get("forward", {})
+                        .get("trains", [])
+                    )
+                    for dt in detail_trains:
+                        if dt.get("number") == number and dt.get("cars"):
+                            train["cars"] = dt["cars"]
+                            logger.info(f"  ✅ {number} uchun {len(dt['cars'])} vagon olindi")
+                            break
+                    else:
+                        logger.info(f"  ⚠️ {number} uchun trainNumber filter ishlamadi")
+
+            except Exception as e:
+                logger.warning(f"  {number} cars olishda xato: {e}")
+
+        return trains
