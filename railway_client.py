@@ -1,12 +1,13 @@
 """
 Railway.uz API Client
 curl_cffi orqali — Chrome TLS fingerprint taqlid qiladi
-(oddiy requests kutubxonasi 403 bilan bloklanadi)
 """
 
 import logging
 import time
 import os
+import uuid
+from urllib.parse import unquote
 from curl_cffi import requests as cffi_requests
 
 logger = logging.getLogger("railway_client")
@@ -30,7 +31,6 @@ class RailwayClient:
     MIN_INTERVAL = 5.0
 
     def __init__(self):
-        # impersonate="chrome" — Chrome brauzerining TLS/HTTP2 izini ishlatadi
         self._session = cffi_requests.Session(impersonate="chrome124")
         self._session.headers.update(HEADERS)
         self._last_request = 0.0
@@ -46,20 +46,13 @@ class RailwayClient:
         try:
             r = self._session.get(f"{BASE}/uz/home", timeout=self.TIMEOUT)
             logger.info(f"Session init status: {r.status_code}")
-            logger.info(f"Cookies after /uz/home: {list(self._session.cookies.keys())}")
 
             token = self._find_xsrf_token()
-
             if not token:
                 token = self._extract_token_from_headers(r)
-
             if not token:
-                # Double-submit CSRF pattern: ko'p tizimlarda server tokenni
-                # o'zi generatsiya qilmaydi, faqat cookie==header tekshiradi.
-                # Shu sababli o'zimiz UUID generatsiya qilib yuboramiz.
-                import uuid
                 token = str(uuid.uuid4())
-                logger.info(f"XSRF token serverdan kelmadi — o'zimiz generatsiya qildik: {token}")
+                logger.info(f"XSRF token o'zimiz generatsiya qildik: {token}")
 
             self._session.headers["X-Xsrf-Token"] = token
             self._session.cookies.set("XSRF-TOKEN", token, domain="eticket.railway.uz")
@@ -68,35 +61,26 @@ class RailwayClient:
         except Exception as e:
             logger.error(f"Session init xato: {e}")
 
+    def _find_xsrf_token(self) -> str:
+        for name in ("XSRF-TOKEN", "csrf_token", "CSRF-TOKEN", "_csrf", "csrftoken"):
+            val = self._session.cookies.get(name, "")
+            if val:
+                return unquote(val)
+        return ""
+
     def _extract_token_from_headers(self, response) -> str:
-        """Set-Cookie headerlardan to'g'ridan-to'g'ri XSRF-TOKEN qiymatini ajratib olish"""
         try:
-            raw_headers = (
+            items = (
                 response.headers.multi_items()
                 if hasattr(response.headers, "multi_items")
                 else list(response.headers.items())
             )
-            for name, value in raw_headers:
+            for name, value in items:
                 if name.lower() == "set-cookie" and "XSRF-TOKEN" in value:
-                    # format: XSRF-TOKEN=xxxxx; Path=/; ...
                     part = value.split("XSRF-TOKEN=", 1)[1]
-                    token = part.split(";")[0].strip()
-                    from urllib.parse import unquote
-                    return unquote(token)
-        except Exception as e:
-            logger.warning(f"Header parse xato: {e}")
-        return ""
-
-    def _find_xsrf_token(self) -> str:
-        """Turli nomdagi CSRF cookie larni qidirish"""
-        for name in ("XSRF-TOKEN", "csrf_token", "CSRF-TOKEN", "_csrf", "csrftoken", "X-CSRF-TOKEN"):
-            val = self._session.cookies.get(name, "")
-            if val:
-                try:
-                    from urllib.parse import unquote
-                    return unquote(val)
-                except Exception:
-                    return val
+                    return unquote(part.split(";")[0].strip())
+        except Exception:
+            pass
         return ""
 
     def _throttle(self):
@@ -120,12 +104,7 @@ class RailwayClient:
 
         for attempt in range(1, self.MAX_RETRIES + 1):
             try:
-                r = self._session.post(
-                    SEARCH_URL,
-                    json=payload,
-                    timeout=self.TIMEOUT,
-                )
-
+                r = self._session.post(SEARCH_URL, json=payload, timeout=self.TIMEOUT)
                 logger.info(f"Search javobi: {r.status_code}")
 
                 if r.status_code == 401:
@@ -134,22 +113,27 @@ class RailwayClient:
                     continue
 
                 if r.status_code == 403:
-                    logger.error(f"403 Forbidden. Body: {r.text[:300]}")
+                    logger.error(f"403 Forbidden: {r.text[:200]}")
                     if "CSRF" in r.text and attempt < self.MAX_RETRIES:
-                        logger.info("CSRF xato — session butunlay yangilanmoqda")
                         self._session.cookies.clear()
                         self._init_session()
                         continue
                     return []
 
+                if r.status_code == 400:
+                    logger.error(f"400 Bad Request: {r.text[:200]}")
+                    # Session yangilash
+                    self._init_session()
+                    continue
+
                 if r.status_code == 429:
                     wait = int(r.headers.get("Retry-After", 60))
-                    logger.warning(f"Rate limit — {wait}s kutilmoqda")
+                    logger.warning(f"Rate limit — {wait}s")
                     time.sleep(wait)
                     continue
 
                 if r.status_code != 200:
-                    logger.error(f"Kutilmagan status {r.status_code}: {r.text[:300]}")
+                    logger.error(f"Status {r.status_code}: {r.text[:200]}")
                     return []
 
                 data = r.json()
@@ -160,11 +144,10 @@ class RailwayClient:
                     .get("trains", [])
                 )
 
-                # cars bo'sh bo'lgan poyezdlar uchun alohida so'rov
+                # Cars bo'sh poyezdlar uchun qayta so'rov
                 trains = self._fill_empty_cars(trains, from_code, to_code, date)
-                logger.info(
-                    f"✅ {from_code}→{to_code} {date} — {len(trains)} poyezd topildi"
-                )
+
+                logger.info(f"✅ {from_code}→{to_code} {date} — {len(trains)} poyezd topildi")
                 return trains
 
             except Exception as e:
@@ -175,47 +158,16 @@ class RailwayClient:
         return []
 
     def _fill_empty_cars(self, trains: list, from_code: str, to_code: str, date: str) -> list:
-        """
-        Cars bo'sh bo'lgan poyezdlar uchun alohida so'rov yuboradi.
-        """
+        """Cars bo'sh poyezdlar uchun xuddi shu parametrlar bilan qayta so'rov."""
         empty = [t for t in trains if not t.get("cars")]
         if not empty:
             return trains
 
-        logger.info(f"Cars bo'sh poyezdlar: {len(empty)} ta — alohida so'rov yuborilmoqda")
+        logger.info(f"Cars bo'sh poyezdlar: {len(empty)} ta — qayta so'rov yuborilmoqda")
 
-        for train in empty:
-            number = train.get("number", "")
-            dep_date = train.get("departureDate", "")
-            # "19.06.2026 19:48" -> "2026-06-19"
-            if dep_date and "." in dep_date:
-                parts = dep_date.split(" ")[0].split(".")
-                if len(parts) == 3:
-                    dep_date_iso = f"{parts[2]}-{parts[1]}-{parts[0]}"
-                else:
-                    dep_date_iso = date
-            else:
-                dep_date_iso = date
-
-            # Variant 1: faqat train raqami bilan filterlab qayta so'rov
-            cars = self._try_get_cars_v1(number, from_code, to_code, dep_date_iso)
-
-            # Variant 2: departure time bilan
-            if not cars:
-                dep_time = dep_date.split(" ")[1] if " " in dep_date else ""
-                cars = self._try_get_cars_v2(number, dep_time, from_code, to_code, dep_date_iso)
-
-            if cars:
-                train["cars"] = cars
-                logger.info(f"  ✅ {number} uchun {len(cars)} vagon olindi")
-            else:
-                logger.info(f"  ⚠️ {number} uchun cars olinmadi (saytda ham yo'q bo'lishi mumkin)")
-
-        return trains
-
-    def _try_get_cars_v1(self, number: str, from_code: str, to_code: str, date: str) -> list:
-        """departure date bilan to'liq qidiruv — ba'zan boshqa sanada bilet chiqadi"""
+        # Xuddi shu so'rovni qayta yuboramiz — ba'zan ikkinchi marta to'liq keladi
         try:
+            time.sleep(1)
             r = self._session.post(
                 SEARCH_URL,
                 json={
@@ -230,45 +182,24 @@ class RailwayClient:
                 timeout=self.TIMEOUT,
             )
             if r.status_code == 200:
-                detail_trains = (
+                fresh_trains = (
                     r.json().get("data", {})
                     .get("directions", {})
                     .get("forward", {})
                     .get("trains", [])
                 )
-                for dt in detail_trains:
-                    if dt.get("number") == number and dt.get("cars"):
-                        return dt["cars"]
+                # Bo'sh bo'lgan poyezdlarga fresh natijadan cars qo'yish
+                fresh_map = {t.get("number"): t for t in fresh_trains}
+                for train in trains:
+                    if not train.get("cars"):
+                        number = train.get("number")
+                        fresh = fresh_map.get(number)
+                        if fresh and fresh.get("cars"):
+                            train["cars"] = fresh["cars"]
+                            logger.info(f"  ✅ {number} uchun {len(fresh['cars'])} vagon olindi")
+                        else:
+                            logger.info(f"  ⚠️ {number} — haqiqatan joy yo'q")
         except Exception as e:
-            logger.warning(f"  v1 xato: {e}")
-        return []
+            logger.warning(f"fill_empty_cars xato: {e}")
 
-    def _try_get_cars_v2(self, number: str, dep_time: str, from_code: str, to_code: str, date: str) -> list:
-        """Poyezd uchun maxsus endpoint sinab ko'rish"""
-        endpoints = [
-            f"{BASE}/api/v3/handbook/trains/{number}/cars",
-            f"{BASE}/api/v3/handbook/trains/cars",
-            f"{BASE}/api/v3/handbook/train-cars",
-        ]
-        payloads = [
-            {"trainNumber": number, "date": date, "depStationCode": from_code, "arvStationCode": to_code},
-            {"number": number, "date": date, "from": from_code, "to": to_code},
-            {"train": number, "date": date, "departureTime": dep_time},
-        ]
-        for url, payload in zip(endpoints, payloads):
-            try:
-                r = self._session.post(url, json=payload, timeout=10)
-                if r.status_code == 200:
-                    data = r.json()
-                    # Turli formatda qaytishi mumkin
-                    cars = (
-                        data.get("data", {}).get("cars") or
-                        data.get("data", []) or
-                        data.get("cars", [])
-                    )
-                    if cars and isinstance(cars, list):
-                        logger.info(f"  ✅ v2 endpoint ishladi: {url}")
-                        return cars
-            except Exception:
-                continue
-        return []
+        return trains
