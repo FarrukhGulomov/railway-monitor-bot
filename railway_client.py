@@ -122,12 +122,11 @@ class RailwayClient:
 
                 if r.status_code == 400:
                     logger.error(f"400 Bad Request: {r.text[:200]}")
-                    # Session yangilash
                     self._init_session()
                     continue
 
                 if r.status_code == 429:
-                    wait = int(r.headers.get("Retry-After", 60))
+                    wait = min(int(r.headers.get("Retry-After", 30)), 30)
                     logger.warning(f"Rate limit — {wait}s")
                     time.sleep(wait)
                     continue
@@ -144,62 +143,12 @@ class RailwayClient:
                     .get("trains", [])
                 )
 
-                # Cars bo'sh poyezdlar uchun qayta so'rov
-                trains = self._fill_empty_cars(trains, from_code, to_code, date)
-
                 logger.info(f"✅ {from_code}→{to_code} {date} — {len(trains)} poyezd topildi")
                 return trains
 
             except Exception as e:
                 logger.error(f"Search xato (urinish {attempt}): {e}")
                 if attempt < self.MAX_RETRIES:
-                    time.sleep(10)
+                    time.sleep(3)
 
         return []
-
-    def _fill_empty_cars(self, trains: list, from_code: str, to_code: str, date: str) -> list:
-        """Cars bo'sh poyezdlar uchun xuddi shu parametrlar bilan qayta so'rov."""
-        empty = [t for t in trains if not t.get("cars")]
-        if not empty:
-            return trains
-
-        logger.info(f"Cars bo'sh poyezdlar: {len(empty)} ta — qayta so'rov yuborilmoqda")
-
-        # Xuddi shu so'rovni qayta yuboramiz — ba'zan ikkinchi marta to'liq keladi
-        try:
-            time.sleep(1)
-            r = self._session.post(
-                SEARCH_URL,
-                json={
-                    "directions": {
-                        "forward": {
-                            "date": date,
-                            "depStationCode": from_code,
-                            "arvStationCode": to_code,
-                        }
-                    }
-                },
-                timeout=self.TIMEOUT,
-            )
-            if r.status_code == 200:
-                fresh_trains = (
-                    r.json().get("data", {})
-                    .get("directions", {})
-                    .get("forward", {})
-                    .get("trains", [])
-                )
-                # Bo'sh bo'lgan poyezdlarga fresh natijadan cars qo'yish
-                fresh_map = {t.get("number"): t for t in fresh_trains}
-                for train in trains:
-                    if not train.get("cars"):
-                        number = train.get("number")
-                        fresh = fresh_map.get(number)
-                        if fresh and fresh.get("cars"):
-                            train["cars"] = fresh["cars"]
-                            logger.info(f"  ✅ {number} uchun {len(fresh['cars'])} vagon olindi")
-                        else:
-                            logger.info(f"  ⚠️ {number} — haqiqatan joy yo'q")
-        except Exception as e:
-            logger.warning(f"fill_empty_cars xato: {e}")
-
-        return trains

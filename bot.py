@@ -667,7 +667,7 @@ async def error_handler(update, context: ContextTypes.DEFAULT_TYPE):
 
 # ─── Monitor loop ────────────────────────────────────────────────────────────────
 async def _monitor_loop(uid: int, mid: str, data: dict, app):
-    client = RailwayClient()
+    client = await asyncio.to_thread(RailwayClient)
     logger.info(f"Monitor boshlandi: uid={uid} mid={mid}")
     first_run = True
 
@@ -679,7 +679,11 @@ async def _monitor_loop(uid: int, mid: str, data: dict, app):
             if current:
                 data = current
 
-            trains = client.search_trains(data["from_code"], data["to_code"], data["date"])
+            # Sinxron (bloklovchi) so'rovni alohida threadda bajaramiz —
+            # shunda bot va boshqa monitorlar to'xtab qolmaydi
+            trains = await asyncio.to_thread(
+                client.search_trains, data["from_code"], data["to_code"], data["date"]
+            )
             db.increment_check(mid)
 
             found = _find_all_trains(
