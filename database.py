@@ -106,3 +106,15 @@ class Database:
                 )
                 data["monitors"][mid]["last_check"] = datetime.now().isoformat()
                 self._write(data)
+
+    def update_monitor_field(self, uid: int, mid: str, field: str, value):
+        """Monitor bitta maydonini yangilash"""
+        with _lock:
+            data = self._read()
+            m = data["monitors"].get(mid)
+            if m and m.get("uid") == uid:
+                m[field] = value
+                m["updated_at"] = datetime.now().isoformat()
+                self._write(data)
+                return True
+        return False
