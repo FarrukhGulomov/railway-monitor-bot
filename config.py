@@ -21,7 +21,7 @@ class Config:
     ]
 
     # Monitoring tekshirish oralig'i (soniya), min 30
-    CHECK_INTERVAL: int = max(45, int(os.getenv("CHECK_INTERVAL", "60")))
+    CHECK_INTERVAL: int = max(20, int(os.getenv("CHECK_INTERVAL", "60")))
 
     # Bir foydalanuvchida max monitoring soni
     MAX_MONITORS_PER_USER: int = int(os.getenv("MAX_MONITORS_PER_USER", "3"))
