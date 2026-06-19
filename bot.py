@@ -871,8 +871,11 @@ def main():
                 CommandHandler("skip", got_max_price),
             ],
         },
-        fallbacks=[CommandHandler("cancel", cmd_cancel)],
-        conversation_timeout=300,
+        fallbacks=[
+            CommandHandler("cancel", cmd_cancel),
+            CommandHandler("monitor", monitor_start),  # qayta /monitor — eskisini bekor qilib qayta boshlaydi
+        ],
+        conversation_timeout=180,
     )
 
     app.add_handler(CommandHandler("start",  cmd_start))
