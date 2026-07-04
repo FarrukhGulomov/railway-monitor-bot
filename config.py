@@ -20,6 +20,15 @@ class Config:
         if x.strip().isdigit()
     ]
 
+    # Admin huquqiga ega Telegram ID lar (Railway "Variables" bo'limida beriladi)
+    # Admin /addUser va /addUsers orqali foydalanuvchi qo'sha oladi, /users orqali
+    # ularning faoliyatini kuzatadi va botdan o'chira oladi. Bir nechta: 111,222
+    ADMIN_IDS: list[int] = [
+        int(x.strip())
+        for x in os.getenv("ADMIN_IDS", "").split(",")
+        if x.strip().isdigit()
+    ]
+
     # Monitoring tekshirish oralig'i (soniya), min 30
     CHECK_INTERVAL: int = max(10, int(os.getenv("CHECK_INTERVAL", "60")))
 
