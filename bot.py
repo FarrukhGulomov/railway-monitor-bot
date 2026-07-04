@@ -11,7 +11,10 @@ import calendar
 from datetime import datetime
 from typing import Optional
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup,
+    ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove,
+)
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     MessageHandler, filters, ContextTypes, ConversationHandler,
@@ -118,6 +121,57 @@ def has_access(uid: int) -> bool:
     return True  # Hech narsa sozlanmagan — ochiq bot (eski xatti-harakat)
 
 
+def _admin_ids() -> list[int]:
+    return Config.ADMIN_IDS if Config.ADMIN_IDS else [ADMIN_ID]
+
+
+async def _notify_admins_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Foydalanuvchi /start bosganda adminlarga uning ochiq ma'lumotlarini yuborish"""
+    user = update.effective_user
+    if user.id in _admin_ids():
+        return  # Admin o'zi haqida xabar olmasin
+    full_name = " ".join(filter(None, [user.first_name, user.last_name])) or "—"
+    username = f"@{user.username}" if user.username else "—"
+    status = "✅ ruxsatli" if has_access(user.id) else "⛔ ruxsatsiz"
+    text = (
+        f"🆕 *Foydalanuvchi /start bosdi* ({status})\n\n"
+        f"👤 FIO: {full_name}\n"
+        f"🆔 ID: `{user.id}`\n"
+        f"🔗 Username: {username}\n"
+        f"🌐 Til: {user.language_code or '—'}"
+    )
+    for aid in _admin_ids():
+        try:
+            await context.application.bot.send_message(aid, text, parse_mode="Markdown")
+        except Exception:
+            pass
+
+
+async def got_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Foydalanuvchi telefon raqamini ulashganda adminlarga yuborish"""
+    contact = update.message.contact
+    user = update.effective_user
+    if not contact or contact.user_id != user.id:
+        return
+    full_name = " ".join(filter(None, [user.first_name, user.last_name])) or "—"
+    username = f"@{user.username}" if user.username else "—"
+    text = (
+        "📱 *Telefon raqami ulashildi:*\n\n"
+        f"👤 FIO: {full_name}\n"
+        f"🆔 ID: `{user.id}`\n"
+        f"🔗 Username: {username}\n"
+        f"📞 Raqam: {contact.phone_number}"
+    )
+    for aid in _admin_ids():
+        if aid == user.id:
+            continue
+        try:
+            await context.application.bot.send_message(aid, text, parse_mode="Markdown")
+        except Exception:
+            pass
+    await update.message.reply_text("✅ Rahmat!", reply_markup=ReplyKeyboardRemove())
+
+
 # ─── Singleton lock ──────────────────────────────────────────────────────────────
 def acquire_lock():
     """Faqat bitta process ishlashini ta'minlash"""
@@ -211,9 +265,17 @@ def _monitor_summary(m: dict) -> str:
 
 
 # ─── /start ─────────────────────────────────────────────────────────────────────
-@restricted
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    name = update.effective_user.first_name
+    user = update.effective_user
+    uid = user.id
+    await _notify_admins_start(update, context)
+
+    if not has_access(uid):
+        logger.warning(f"Ruxsatsiz: uid={uid}")
+        await update.message.reply_text("⛔ Sizga ruxsat yo'q.")
+        return
+    db.touch_user_activity(uid)
+
     extra = (
         "\n\n👑 *Admin buyruqlari:*\n"
         "/addUser — Bitta foydalanuvchi qo'shish\n"
@@ -221,9 +283,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/users — Foydalanuvchilar va faoliyati\n"
         "/removeUser — Foydalanuvchini o'chirish\n"
         "/logs — Loglar"
-    ) if is_admin(update.effective_user.id) else ""
+    ) if is_admin(uid) else ""
     await update.message.reply_text(
-        f"Salom, {name}! 🚆\n\n"
+        f"Salom, {user.first_name}! 🚆\n\n"
         "📌 *Buyruqlar:*\n"
         "/monitor — Yangi kuzatuv\n"
         "/list — Faol kuzatuvlar (tahrirlash/o'chirish)\n"
@@ -231,6 +293,16 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/help — Yordam" + extra,
         parse_mode="Markdown",
     )
+
+    if not is_admin(uid):
+        contact_kb = ReplyKeyboardMarkup(
+            [[KeyboardButton("📱 Telefon raqamni ulashish", request_contact=True)]],
+            resize_keyboard=True, one_time_keyboard=True,
+        )
+        await update.message.reply_text(
+            "📱 Aloqa uchun telefon raqamingizni ulashasizmi? (ixtiyoriy)",
+            reply_markup=contact_kb,
+        )
 
 
 @restricted
@@ -1127,6 +1199,7 @@ def main():
         filters.TEXT & ~filters.COMMAND,
         mgr_price_text,
     ))
+    app.add_handler(MessageHandler(filters.CONTACT, got_contact))
 
     app.add_error_handler(error_handler)
 
