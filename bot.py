@@ -9,6 +9,7 @@ import os
 import fcntl
 import calendar
 from datetime import datetime
+from typing import Optional
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -89,11 +90,32 @@ TIME_RANGES = {
     "custom":  (None, None,       "✏️ O'zim kiritaman"),
 }
 
-ADMIN_ID = 370898987
+ADMIN_ID = 370898987  # eski standart admin — ADMIN_IDS sozlanmagan bo'lsa fallback
 LOCK_FILE = "/tmp/railway_bot.lock"
 
 db = Database()
 security = SecurityMiddleware()
+
+
+def is_admin(uid: int) -> bool:
+    """Foydalanuvchi admin (Railway ADMIN_IDS o'zgaruvchisidan) mi?"""
+    if Config.ADMIN_IDS:
+        return uid in Config.ADMIN_IDS
+    return uid == ADMIN_ID
+
+
+def has_access(uid: int) -> bool:
+    """Foydalanuvchi botdan foydalanishga ruxsatlimi?"""
+    if is_admin(uid):
+        return True
+    if db.is_added_user(uid):
+        return True
+    if Config.ALLOWED_USERS:
+        return uid in Config.ALLOWED_USERS
+    if Config.ADMIN_IDS:
+        # Admin tizimi yoqilgan — endi faqat admin va u qo'shgan userlar ruxsatli
+        return False
+    return True  # Hech narsa sozlanmagan — ochiq bot (eski xatti-harakat)
 
 
 # ─── Singleton lock ──────────────────────────────────────────────────────────────
@@ -114,10 +136,11 @@ def acquire_lock():
 def restricted(func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         uid = update.effective_user.id
-        if not security.is_allowed(uid):
+        if not has_access(uid):
             logger.warning(f"Ruxsatsiz: uid={uid}")
             await update.effective_message.reply_text("⛔ Sizga ruxsat yo'q.")
             return ConversationHandler.END
+        db.touch_user_activity(uid)
         return await func(update, context, *args, **kwargs)
     wrapper.__name__ = func.__name__
     return wrapper
@@ -191,8 +214,14 @@ def _monitor_summary(m: dict) -> str:
 @restricted
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = update.effective_user.first_name
-    is_admin = update.effective_user.id == ADMIN_ID
-    extra = "\n/logs — Loglar (admin)" if is_admin else ""
+    extra = (
+        "\n\n👑 *Admin buyruqlari:*\n"
+        "/addUser — Bitta foydalanuvchi qo'shish\n"
+        "/addUsers — Bir nechta foydalanuvchi qo'shish\n"
+        "/users — Foydalanuvchilar va faoliyati\n"
+        "/removeUser — Foydalanuvchini o'chirish\n"
+        "/logs — Loglar"
+    ) if is_admin(update.effective_user.id) else ""
     await update.message.reply_text(
         f"Salom, {name}! 🚆\n\n"
         "📌 *Buyruqlar:*\n"
@@ -206,6 +235,14 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @restricted
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    extra = (
+        "\n\n👑 *Admin buyruqlari:*\n"
+        "/addUser `<id> [ism]` — bitta foydalanuvchi qo'shish\n"
+        "/addUsers `<id1> <id2> ...` — bir nechtasini qo'shish\n"
+        "/users — ro'yxat va faoliyat statistikasi\n"
+        "/removeUser `<id>` — foydalanuvchini o'chirish\n"
+        "/logs — bot loglari"
+    ) if is_admin(update.effective_user.id) else ""
     await update.message.reply_text(
         "🚆 *Railway Monitor Bot*\n\n"
         "1️⃣ /monitor — sana, marshrut, vaqt tanlang\n"
@@ -213,14 +250,14 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "3️⃣ Har minutda kuzatib, yangi chiqqanda xabar beradi\n"
         "4️⃣ /list — kuzatuvlarni ko'rish, tahrirlash, o'chirish\n\n"
         "*Interval:* 60 soniyada bir tekshirish\n"
-        "*Limit:* Bir vaqtda 5 ta kuzatuv",
+        "*Limit:* Bir vaqtda 5 ta kuzatuv" + extra,
         parse_mode="Markdown",
     )
 
 
 # ─── /logs ──────────────────────────────────────────────────────────────────────
 async def cmd_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    if not is_admin(update.effective_user.id):
         await update.message.reply_text("⛔ Faqat admin uchun.")
         return
     if not os.path.exists("bot.log"):
@@ -235,6 +272,189 @@ async def cmd_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"📋 *Bot log (oxirgi {len(last)} qator):*\n\n```\n{text}\n```",
         parse_mode="Markdown",
+    )
+
+
+# ─── Admin: foydalanuvchilarni boshqarish ───────────────────────────────────────
+def _fmt_dt(iso: Optional[str]) -> str:
+    if not iso:
+        return "—"
+    return iso[:16].replace("T", " ")
+
+
+async def cmd_add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        await update.message.reply_text("⛔ Faqat admin uchun.")
+        return
+    args = context.args
+    if not args or not args[0].lstrip("-").isdigit():
+        await update.message.reply_text(
+            "❗ Foydalanish: `/addUser <telegram_id> [ism]`\n"
+            "Masalan: `/addUser 123456789 Aziz`",
+            parse_mode="Markdown",
+        )
+        return
+    tid = int(args[0])
+    name = " ".join(args[1:]) if len(args) > 1 else ""
+    is_new = db.add_user(tid, added_by=uid, first_name=name)
+    verb = "qo'shildi" if is_new else "allaqachon ro'yxatda edi (qayta faollashtirildi)"
+    await update.message.reply_text(
+        f"✅ Foydalanuvchi `{tid}` {verb}" + (f" — {name}" if name else ""),
+        parse_mode="Markdown",
+    )
+    try:
+        await context.application.bot.send_message(
+            tid, "✅ Sizga botdan foydalanish huquqi berildi!\n/start bosing."
+        )
+    except Exception:
+        pass
+
+
+async def cmd_add_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        await update.message.reply_text("⛔ Faqat admin uchun.")
+        return
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "❗ Foydalanish: `/addUsers <id1> <id2> <id3> ...`\n"
+            "Masalan: `/addUsers 111111111 222222222 333333333`",
+            parse_mode="Markdown",
+        )
+        return
+    ids = []
+    for a in args:
+        for part in a.replace(",", " ").split():
+            if part.isdigit() and int(part) not in ids:
+                ids.append(int(part))
+    if not ids:
+        await update.message.reply_text("❌ To'g'ri telegram ID topilmadi.")
+        return
+    added = sum(1 for tid in ids if db.add_user(tid, added_by=uid))
+    reactivated = len(ids) - added
+    await update.message.reply_text(
+        f"✅ {added} ta yangi qo'shildi, {reactivated} ta qayta faollashtirildi.\n"
+        f"Jami: {len(ids)} ta ID."
+    )
+    for tid in ids:
+        try:
+            await context.application.bot.send_message(
+                tid, "✅ Sizga botdan foydalanish huquqi berildi!\n/start bosing."
+            )
+        except Exception:
+            pass
+
+
+async def cmd_remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        await update.message.reply_text("⛔ Faqat admin uchun.")
+        return
+    args = context.args
+    if not args or not args[0].isdigit():
+        await update.message.reply_text(
+            "❗ Foydalanish: `/removeUser <telegram_id>`", parse_mode="Markdown"
+        )
+        return
+    tid = int(args[0])
+    if db.remove_user(tid):
+        db.deactivate_all(tid)
+        await update.message.reply_text(f"✅ Foydalanuvchi `{tid}` botdan o'chirildi.", parse_mode="Markdown")
+        try:
+            await context.application.bot.send_message(tid, "⛔ Sizning botdan foydalanish huquqingiz bekor qilindi.")
+        except Exception:
+            pass
+    else:
+        await update.message.reply_text("❌ Topilmadi yoki allaqachon o'chirilgan.")
+
+
+def _users_keyboard(users: list) -> InlineKeyboardMarkup:
+    rows = []
+    for u in users:
+        label = f"👤 {u['tid']}" + (f" — {u['first_name']}" if u.get("first_name") else "")
+        rows.append([InlineKeyboardButton(label, callback_data=f"usr_show|{u['tid']}")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        await update.message.reply_text("⛔ Faqat admin uchun.")
+        return
+    users = db.get_users(active_only=True)
+    if not users:
+        await update.message.reply_text("📭 Hali hech kim qo'shilmagan.\n/addUser — qo'shish")
+        return
+    await update.message.reply_text(
+        f"👥 *Ruxsatli foydalanuvchilar ({len(users)} ta):*\n\nFaoliyatini ko'rish uchun tanlang:",
+        parse_mode="Markdown",
+        reply_markup=_users_keyboard(users),
+    )
+
+
+async def usr_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    if not is_admin(q.from_user.id):
+        await q.edit_message_text("⛔ Faqat admin uchun.")
+        return
+    _, tid_str = q.data.split("|", 1)
+    tid = int(tid_str)
+    u = db.get_user(tid)
+    if not u:
+        await q.edit_message_text("❌ Topilmadi.")
+        return
+    stats = db.get_user_monitor_stats(tid)
+    await q.edit_message_text(
+        f"👤 *Foydalanuvchi:* `{tid}`\n"
+        f"📛 Ism: {u.get('first_name') or '—'}\n"
+        f"📅 Qo'shilgan: {_fmt_dt(u.get('added_at'))}\n"
+        f"🕐 Oxirgi faollik: {_fmt_dt(u.get('last_seen'))}\n"
+        f"🔢 Amallar soni: {u.get('action_count', 0)}\n"
+        f"📊 Kuzatuvlar: {stats['active']} faol / {stats['total']} jami\n"
+        f"🔄 Jami tekshiruvlar: {stats['total_checks']}",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗑 Botdan o'chirish", callback_data=f"usr_del|{tid}")],
+            [InlineKeyboardButton("◀️ Orqaga", callback_data="usr_back")],
+        ]),
+    )
+
+
+async def usr_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    if not is_admin(q.from_user.id):
+        await q.edit_message_text("⛔ Faqat admin uchun.")
+        return
+    _, tid_str = q.data.split("|", 1)
+    tid = int(tid_str)
+    if db.remove_user(tid):
+        db.deactivate_all(tid)
+        await q.edit_message_text(f"✅ Foydalanuvchi `{tid}` botdan o'chirildi.", parse_mode="Markdown")
+        try:
+            await context.application.bot.send_message(tid, "⛔ Sizning botdan foydalanish huquqingiz bekor qilindi.")
+        except Exception:
+            pass
+    else:
+        await q.edit_message_text("❌ Topilmadi yoki allaqachon o'chirilgan.")
+
+
+async def usr_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    if not is_admin(q.from_user.id):
+        return
+    users = db.get_users(active_only=True)
+    if not users:
+        await q.edit_message_text("📭 Hali hech kim qo'shilmagan.")
+        return
+    await q.edit_message_text(
+        f"👥 *Ruxsatli foydalanuvchilar ({len(users)} ta):*\n\nFaoliyatini ko'rish uchun tanlang:",
+        parse_mode="Markdown",
+        reply_markup=_users_keyboard(users),
     )
 
 
@@ -884,6 +1104,15 @@ def main():
     app.add_handler(CommandHandler("logs",   cmd_logs))
     app.add_handler(CommandHandler("list",   cmd_list))
     app.add_handler(monitor_conv)
+
+    # Admin: foydalanuvchilarni boshqarish
+    app.add_handler(CommandHandler("addUser",    cmd_add_user))
+    app.add_handler(CommandHandler("addUsers",   cmd_add_users))
+    app.add_handler(CommandHandler("removeUser", cmd_remove_user))
+    app.add_handler(CommandHandler("users",      cmd_users))
+    app.add_handler(CallbackQueryHandler(usr_show, pattern=r"^usr_show\|"))
+    app.add_handler(CallbackQueryHandler(usr_del,  pattern=r"^usr_del\|"))
+    app.add_handler(CallbackQueryHandler(usr_back, pattern=r"^usr_back$"))
 
     # /list manager handlers
     app.add_handler(CallbackQueryHandler(mgr_show,       pattern=r"^mgr_show\|"))

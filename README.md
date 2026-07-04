@@ -47,6 +47,7 @@ cp .env.example .env
 ```env
 BOT_TOKEN=sizning_bot_tokeningiz
 ALLOWED_USERS=sizning_telegram_id_ingiz
+ADMIN_IDS=sizning_telegram_id_ingiz
 ```
 
 **Bot token** — [@BotFather](https://t.me/BotFather) dan oling  
@@ -68,6 +69,16 @@ python bot.py
 | `/list` | Faol kuzatuvlar ro'yxati |
 | `/stop <id>` | Kuzatuvni to'xtatish |
 | `/help` | Yordam |
+
+### Admin buyruqlari (`ADMIN_IDS` da ko'rsatilgan foydalanuvchilar uchun)
+
+| Buyruq | Vazifasi |
+|--------|---------|
+| `/addUser <id> [ism]` | Bitta Telegram foydalanuvchini botga qo'shish |
+| `/addUsers <id1> <id2> ...` | Bir nechta foydalanuvchini birdaniga qo'shish |
+| `/users` | Qo'shilgan foydalanuvchilar va ularning faoliyati (oxirgi faollik, kuzatuvlar soni) |
+| `/removeUser <id>` | Foydalanuvchini botdan o'chirish |
+| `/logs` | Bot loglarini ko'rish |
 
 ---
 

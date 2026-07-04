@@ -23,15 +23,18 @@ class Database:
 
     def _ensure_file(self):
         if not os.path.exists(self.FILE):
-            self._write({"monitors": {}})
+            self._write({"monitors": {}, "users": {}})
 
     def _read(self) -> dict:
         try:
             with open(self.FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+                data = json.load(f)
         except Exception as e:
             logger.error(f"DB read xato: {e}")
-            return {"monitors": {}}
+            data = {}
+        data.setdefault("monitors", {})
+        data.setdefault("users", {})
+        return data
 
     def _write(self, data: dict):
         try:
@@ -118,3 +121,88 @@ class Database:
                 self._write(data)
                 return True
         return False
+
+    # ─── Users (admin tomonidan qo'shilgan foydalanuvchilar) ───────────────────────
+    def add_user(self, tid: int, added_by: int, username: str = "", first_name: str = "") -> bool:
+        """Foydalanuvchini ruxsat etilganlar ro'yxatiga qo'shish.
+        Qaytadi: True — yangi qo'shildi, False — allaqachon bor edi (faollashtirildi)."""
+        with _lock:
+            data = self._read()
+            key = str(tid)
+            existing = data["users"].get(key)
+            if existing:
+                existing["active"] = True
+                existing["updated_at"] = datetime.now().isoformat()
+                if username:
+                    existing["username"] = username
+                if first_name:
+                    existing["first_name"] = first_name
+                self._write(data)
+                return False
+            data["users"][key] = {
+                "tid": tid,
+                "username": username,
+                "first_name": first_name,
+                "added_by": added_by,
+                "added_at": datetime.now().isoformat(),
+                "active": True,
+                "last_seen": None,
+                "action_count": 0,
+            }
+            self._write(data)
+            return True
+
+    def remove_user(self, tid: int) -> bool:
+        """Foydalanuvchini botdan o'chirish (ruxsatini bekor qilish)"""
+        with _lock:
+            data = self._read()
+            key = str(tid)
+            u = data["users"].get(key)
+            if u and u.get("active"):
+                u["active"] = False
+                u["removed_at"] = datetime.now().isoformat()
+                self._write(data)
+                return True
+        return False
+
+    def is_added_user(self, tid: int) -> bool:
+        with _lock:
+            data = self._read()
+        u = data["users"].get(str(tid))
+        return bool(u and u.get("active"))
+
+    def get_users(self, active_only: bool = True) -> list:
+        with _lock:
+            data = self._read()
+        users = list(data["users"].values())
+        if active_only:
+            users = [u for u in users if u.get("active")]
+        return sorted(users, key=lambda u: u.get("added_at") or "", reverse=True)
+
+    def get_user(self, tid: int) -> Optional[dict]:
+        with _lock:
+            data = self._read()
+        return data["users"].get(str(tid))
+
+    def touch_user_activity(self, tid: int):
+        """Foydalanuvchi faolligini qayd qilish (oxirgi faollik, amallar soni)"""
+        with _lock:
+            data = self._read()
+            key = str(tid)
+            if key in data["users"]:
+                data["users"][key]["last_seen"] = datetime.now().isoformat()
+                data["users"][key]["action_count"] = data["users"][key].get("action_count", 0) + 1
+                self._write(data)
+
+    def get_user_monitor_stats(self, tid: int) -> dict:
+        """Foydalanuvchining kuzatuvlar bo'yicha statistikasi"""
+        with _lock:
+            data = self._read()
+        monitors = [m for m in data["monitors"].values() if m.get("uid") == tid]
+        active = [m for m in monitors if m.get("active")]
+        total_checks = sum(m.get("check_count", 0) for m in monitors)
+        return {
+            "total": len(monitors),
+            "active": len(active),
+            "total_checks": total_checks,
+        }
