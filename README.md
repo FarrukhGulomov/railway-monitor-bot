@@ -98,8 +98,19 @@ Railway **Variables** bo'limida quyidagilarni qo'ying:
 | `BOT_TOKEN` | BotFather'dan olingan token |
 | `ADMIN_IDS` | Admin Telegram ID lari (vergul bilan) |
 | `TZ` | `Asia/Tashkent` — sana/vaqt O'zbekiston vaqtida ishlashi uchun |
+| `DATA_DIR` | `/data` — ma'lumotlar Volume'da saqlanishi uchun (quyida) |
 
-> ♻️ Bot restart bo'lganda (yangi deploy) faol kuzatuvlar avtomatik davom etadi,
+### ⚠️ MUHIM: Railway'da Volume ulash (ma'lumotlar o'chib ketmasligi uchun)
+
+Railway konteynerining diski **vaqtinchalik** — har redeploy'da tozalanadi.
+Volume ulamasangiz, qo'shilgan foydalanuvchilar va kuzatuvlar har deploy'da o'chib ketadi!
+
+1. Railway'da servisingizni oching → o'ng tomonda **Settings** yoki servis kartochkasida o'ng tugma → **Attach Volume** (yoki **+ New** → **Volume**)
+2. **Mount path** ga `/data` yozing
+3. **Variables** bo'limiga `DATA_DIR=/data` qo'shing
+4. Redeploy qiling — endi `data.json` Volume'da saqlanadi va deploy'lar orasida yo'qolmaydi
+
+> ♻️ Volume ulangandan keyin: bot restart bo'lganda faol kuzatuvlar avtomatik davom etadi,
 > sanasi o'tib ketganlari esa ro'yxatdan avtomatik olib tashlanadi.
 
 ---

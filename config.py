@@ -29,6 +29,11 @@ class Config:
         if x.strip().isdigit()
     ]
 
+    # Ma'lumotlar papkasi — data.json shu yerda saqlanadi.
+    # Railway'da Volume ulang (masalan /data) va DATA_DIR=/data qo'ying,
+    # aks holda har redeploy'da foydalanuvchilar va kuzatuvlar o'chib ketadi!
+    DATA_DIR: str = os.getenv("DATA_DIR", ".").strip() or "."
+
     # Monitoring tekshirish oralig'i (soniya), min 30
     CHECK_INTERVAL: int = max(10, int(os.getenv("CHECK_INTERVAL", "60")))
 

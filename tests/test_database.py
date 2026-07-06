@@ -130,6 +130,14 @@ class TestMonitors:
 
 
 class TestResilience:
+    def test_nested_data_dir_created(self, tmp_path):
+        # DATA_DIR (masalan Railway Volume /data) hali mavjud bo'lmasa ham ishlashi kerak
+        from database import Database
+        path = tmp_path / "volume" / "sub" / "data.json"
+        db = Database(path=str(path))
+        assert path.exists()
+        assert db.add_user(1, added_by=2) is True
+
     def test_corrupt_file_returns_empty(self, tmp_path):
         from database import Database
         path = tmp_path / "data.json"
