@@ -6,6 +6,7 @@ import asyncio
 import logging
 import sys
 import os
+import time
 import fcntl
 import calendar
 from datetime import datetime
@@ -15,6 +16,7 @@ from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
     ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove,
 )
+from telegram.helpers import escape_markdown
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     MessageHandler, filters, ContextTypes, ConversationHandler,
@@ -125,50 +127,66 @@ def _admin_ids() -> list[int]:
     return Config.ADMIN_IDS if Config.ADMIN_IDS else [ADMIN_ID]
 
 
+def _user_card(user) -> str:
+    """Foydalanuvchining ochiq ma'lumotlari — Markdown xavfsiz (ism/username escape qilinadi)"""
+    full_name = " ".join(filter(None, [user.first_name, user.last_name])) or "—"
+    username = f"@{user.username}" if user.username else "—"
+    return (
+        f"👤 FIO: {escape_markdown(full_name)}\n"
+        f"🆔 ID: `{user.id}`\n"
+        f"🔗 Username: {escape_markdown(username)}"
+    )
+
+
+# uid -> oxirgi notifikatsiya vaqti; /start spam bilan adminni bezovta qilmaslik uchun
+_START_NOTIFY_INTERVAL = 6 * 3600
+_last_start_notify: dict[int, float] = {}
+
+
 async def _notify_admins_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Foydalanuvchi /start bosganda adminlarga uning ochiq ma'lumotlarini yuborish"""
     user = update.effective_user
     if user.id in _admin_ids():
         return  # Admin o'zi haqida xabar olmasin
-    full_name = " ".join(filter(None, [user.first_name, user.last_name])) or "—"
-    username = f"@{user.username}" if user.username else "—"
+    now = time.time()
+    if now - _last_start_notify.get(user.id, 0.0) < _START_NOTIFY_INTERVAL:
+        return
+    _last_start_notify[user.id] = now
     status = "✅ ruxsatli" if has_access(user.id) else "⛔ ruxsatsiz"
     text = (
         f"🆕 *Foydalanuvchi /start bosdi* ({status})\n\n"
-        f"👤 FIO: {full_name}\n"
-        f"🆔 ID: `{user.id}`\n"
-        f"🔗 Username: {username}\n"
+        f"{_user_card(user)}\n"
         f"🌐 Til: {user.language_code or '—'}"
     )
     for aid in _admin_ids():
         try:
             await context.application.bot.send_message(aid, text, parse_mode="Markdown")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Admin {aid} ga /start xabari yuborilmadi: {e}")
 
 
 async def got_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Foydalanuvchi telefon raqamini ulashganda adminlarga yuborish"""
+    """Foydalanuvchi telefon raqamini ulashganda adminlarga yuborish va saqlash"""
     contact = update.message.contact
     user = update.effective_user
-    if not contact or contact.user_id != user.id:
+    if not contact:
         return
-    full_name = " ".join(filter(None, [user.first_name, user.last_name])) or "—"
-    username = f"@{user.username}" if user.username else "—"
+    if contact.user_id != user.id:
+        await update.message.reply_text("❌ Iltimos, tugma orqali o'z raqamingizni ulashing.")
+        return
+    db.set_user_phone(user.id, contact.phone_number)
     text = (
         "📱 *Telefon raqami ulashildi:*\n\n"
-        f"👤 FIO: {full_name}\n"
-        f"🆔 ID: `{user.id}`\n"
-        f"🔗 Username: {username}\n"
-        f"📞 Raqam: {contact.phone_number}"
+        f"{_user_card(user)}\n"
+        f"📞 Raqam: {escape_markdown(contact.phone_number)}"
     )
     for aid in _admin_ids():
         if aid == user.id:
             continue
         try:
             await context.application.bot.send_message(aid, text, parse_mode="Markdown")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Admin {aid} ga kontakt xabari yuborilmadi: {e}")
     await update.message.reply_text("✅ Rahmat!", reply_markup=ReplyKeyboardRemove())
 
 
@@ -285,7 +303,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/logs — Loglar"
     ) if is_admin(uid) else ""
     await update.message.reply_text(
-        f"Salom, {user.first_name}! 🚆\n\n"
+        f"Salom, {escape_markdown(user.first_name or '')}! 🚆\n\n"
         "📌 *Buyruqlar:*\n"
         "/monitor — Yangi kuzatuv\n"
         "/list — Faol kuzatuvlar (tahrirlash/o'chirish)\n"
@@ -294,7 +312,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
     )
 
-    if not is_admin(uid):
+    u = db.get_user(uid)
+    if not is_admin(uid) and not (u and u.get("phone")):
         contact_kb = ReplyKeyboardMarkup(
             [[KeyboardButton("📱 Telefon raqamni ulashish", request_contact=True)]],
             resize_keyboard=True, one_time_keyboard=True,
@@ -481,7 +500,8 @@ async def usr_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
     stats = db.get_user_monitor_stats(tid)
     await q.edit_message_text(
         f"👤 *Foydalanuvchi:* `{tid}`\n"
-        f"📛 Ism: {u.get('first_name') or '—'}\n"
+        f"📛 Ism: {escape_markdown(u.get('first_name') or '—')}\n"
+        f"📞 Tel: {escape_markdown(u.get('phone') or '—')}\n"
         f"📅 Qo'shilgan: {_fmt_dt(u.get('added_at'))}\n"
         f"🕐 Oxirgi faollik: {_fmt_dt(u.get('last_seen'))}\n"
         f"🔢 Amallar soni: {u.get('action_count', 0)}\n"
@@ -737,6 +757,7 @@ async def _confirm_and_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
 @restricted
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    db.deactivate_expired(datetime.now().strftime("%Y-%m-%d"))  # eski sanalarni avtomatik tozalash
     monitors = db.get_active_monitors(uid)
     if not monitors:
         await update.message.reply_text("📭 Faol kuzatuv yo'q.\n/monitor — yangi boshlash")
@@ -895,6 +916,7 @@ async def mgr_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     uid = q.from_user.id
+    db.deactivate_expired(datetime.now().strftime("%Y-%m-%d"))
     monitors = db.get_active_monitors(uid)
     if not monitors:
         await q.edit_message_text("📭 Faol kuzatuv yo'q.")
@@ -913,18 +935,27 @@ async def mgr_price_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     mid = context.user_data.get("edit_mid")
     uid = update.effective_user.id
-    if text == "/skip":
-        db.update_monitor_field(uid, mid, "max_price", None)
-        await update.message.reply_text("✅ Narx cheki olib tashlandi.\n\n/list — ro'yxatga qaytish")
-    else:
-        cleaned = text.replace(" ","").replace(",","")
-        if not cleaned.isdigit():
-            await update.message.reply_text("❌ Faqat raqam yoki /skip")
-            return
-        db.update_monitor_field(uid, mid, "max_price", int(cleaned))
-        await update.message.reply_text(f"✅ Narx yangilandi: {int(cleaned):,} so'm\n\n/list — ro'yxatga qaytish")
+    cleaned = text.replace(" ","").replace(",","")
+    if not cleaned.isdigit():
+        await update.message.reply_text("❌ Faqat raqam yoki /skip")
+        return
+    db.update_monitor_field(uid, mid, "max_price", int(cleaned))
+    await update.message.reply_text(f"✅ Narx yangilandi: {int(cleaned):,} so'm\n\n/list — ro'yxatga qaytish")
     context.user_data.pop("edit_field", None)
     context.user_data.pop("edit_mid", None)
+
+
+async def mgr_price_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Narx tahrirlashda /skip — chekni olib tashlash.
+    (Buyruqlar filters.TEXT ga tushmaydi, shuning uchun alohida handler kerak)"""
+    if context.user_data.get("edit_field") != "price":
+        return
+    mid = context.user_data.get("edit_mid")
+    uid = update.effective_user.id
+    db.update_monitor_field(uid, mid, "max_price", None)
+    context.user_data.pop("edit_field", None)
+    context.user_data.pop("edit_mid", None)
+    await update.message.reply_text("✅ Narx cheki olib tashlandi.\n\n/list — ro'yxatga qaytish")
 
 
 # ─── /stop ──────────────────────────────────────────────────────────────────────
@@ -1076,8 +1107,9 @@ def _time_in_range(dep_date_str: str, t_from: str, t_to: str) -> bool:
         return True
     try:
         parts = dep_date_str.strip().split(" ")
-        time_part = parts[1] if len(parts) > 1 else "00:00"
-        h, m = map(int, time_part.split(":"))
+        if len(parts) < 2:
+            return True  # vaqt qismi yo'q — poyezdni filtrlab tashlamaymiz
+        h, m = map(int, parts[1].split(":"))
         dep_min = h * 60 + m
         def to_min(t):
             hh, mm = map(int, t.split(":")); return hh * 60 + mm
@@ -1137,11 +1169,29 @@ def _find_all_trains(trains, car_type, max_price=None, time_from="00:00", time_t
 
 
 # ─── Main ────────────────────────────────────────────────────────────────────────
+async def _resume_monitors(app):
+    """Bot (qayta) ishga tushganda data.json dagi faol kuzatuvlarni davom ettirish.
+    Aks holda Railway restartidan keyin kuzatuvlar 'faol' ko'rinsa ham ishlamaydi."""
+    expired = db.deactivate_expired(datetime.now().strftime("%Y-%m-%d"))
+    if expired:
+        logger.info(f"🗑 {len(expired)} ta muddati o'tgan kuzatuv avtomatik o'chirildi")
+    monitors = db.get_all_active_monitors()
+    for m in monitors:
+        asyncio.create_task(_monitor_loop(m["uid"], m["id"], m, app))
+    if monitors:
+        logger.info(f"♻️ {len(monitors)} ta faol kuzatuv restartdan keyin tiklandi")
+
+
 def main():
     lock_fd = acquire_lock()  # Faqat bitta instance
 
     Config.validate()
-    app = Application.builder().token(Config.BOT_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(Config.BOT_TOKEN)
+        .post_init(_resume_monitors)
+        .build()
+    )
 
     monitor_conv = ConversationHandler(
         entry_points=[CommandHandler("monitor", monitor_start)],
@@ -1199,6 +1249,7 @@ def main():
         filters.TEXT & ~filters.COMMAND,
         mgr_price_text,
     ))
+    app.add_handler(CommandHandler("skip", mgr_price_skip))
     app.add_handler(MessageHandler(filters.CONTACT, got_contact))
 
     app.add_error_handler(error_handler)

@@ -18,7 +18,9 @@ _lock = threading.Lock()
 class Database:
     FILE = "data.json"
 
-    def __init__(self):
+    def __init__(self, path: Optional[str] = None):
+        if path:
+            self.FILE = path
         self._ensure_file()
 
     def _ensure_file(self):
@@ -62,6 +64,28 @@ class Database:
             m for m in data["monitors"].values()
             if m.get("uid") == uid and m.get("active")
         ]
+
+    def get_all_active_monitors(self) -> list:
+        """Barcha foydalanuvchilarning faol kuzatuvlari (restartdan keyin tiklash uchun)"""
+        with _lock:
+            data = self._read()
+        return [m for m in data["monitors"].values() if m.get("active")]
+
+    def deactivate_expired(self, today: str) -> list:
+        """Sanasi o'tib ketgan faol kuzatuvlarni avtomatik o'chirish.
+        `today` — YYYY-MM-DD; o'chirilgan kuzatuvlar ro'yxatini qaytaradi."""
+        removed = []
+        with _lock:
+            data = self._read()
+            for m in data["monitors"].values():
+                if m.get("active") and m.get("date") and m["date"] < today:
+                    m["active"] = False
+                    m["stopped_at"] = datetime.now().isoformat()
+                    m["stop_reason"] = "expired"
+                    removed.append(dict(m))
+            if removed:
+                self._write(data)
+        return removed
 
     def is_active(self, mid: str) -> bool:
         with _lock:
@@ -183,6 +207,17 @@ class Database:
         with _lock:
             data = self._read()
         return data["users"].get(str(tid))
+
+    def set_user_phone(self, tid: int, phone: str) -> bool:
+        """Foydalanuvchi telefon raqamini saqlash (faqat ro'yxatda bo'lsa)"""
+        with _lock:
+            data = self._read()
+            u = data["users"].get(str(tid))
+            if u:
+                u["phone"] = phone
+                self._write(data)
+                return True
+        return False
 
     def touch_user_activity(self, tid: int):
         """Foydalanuvchi faolligini qayd qilish (oxirgi faollik, amallar soni)"""
