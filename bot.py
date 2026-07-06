@@ -98,7 +98,7 @@ TIME_RANGES = {
 ADMIN_ID = 370898987  # eski standart admin — ADMIN_IDS sozlanmagan bo'lsa fallback
 LOCK_FILE = "/tmp/railway_bot.lock"
 
-db = Database()
+db = Database(path=os.path.join(Config.DATA_DIR, "data.json"))
 security = SecurityMiddleware()
 
 
@@ -1186,6 +1186,11 @@ def main():
     lock_fd = acquire_lock()  # Faqat bitta instance
 
     Config.validate()
+    if os.getenv("RAILWAY_ENVIRONMENT") and Config.DATA_DIR in (".", ""):
+        logger.warning(
+            "⚠️ DATA_DIR sozlanmagan — Railway'da data.json har redeploy'da O'CHIB KETADI! "
+            "Service → Volume ulang (mount path: /data) va Variables'ga DATA_DIR=/data qo'ying."
+        )
     app = (
         Application.builder()
         .token(Config.BOT_TOKEN)

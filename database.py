@@ -24,6 +24,8 @@ class Database:
         self._ensure_file()
 
     def _ensure_file(self):
+        parent = os.path.dirname(os.path.abspath(self.FILE))
+        os.makedirs(parent, exist_ok=True)
         if not os.path.exists(self.FILE):
             self._write({"monitors": {}, "users": {}})
 
