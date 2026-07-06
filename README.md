@@ -91,6 +91,28 @@ python bot.py
 echo "worker: python bot.py" > Procfile
 ```
 
+Railway **Variables** bo'limida quyidagilarni qo'ying:
+
+| Variable | Qiymat |
+|----------|--------|
+| `BOT_TOKEN` | BotFather'dan olingan token |
+| `ADMIN_IDS` | Admin Telegram ID lari (vergul bilan) |
+| `TZ` | `Asia/Tashkent` — sana/vaqt O'zbekiston vaqtida ishlashi uchun |
+
+> ♻️ Bot restart bo'lganda (yangi deploy) faol kuzatuvlar avtomatik davom etadi,
+> sanasi o'tib ketganlari esa ro'yxatdan avtomatik olib tashlanadi.
+
+---
+
+## Testlar
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+Har bir push/PR da GitHub Actions CI testlarni avtomatik ishga tushiradi.
+
 ---
 
 ## Muhim

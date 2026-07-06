@@ -1,0 +1,91 @@
+"""Poyezd filtrlari (_time_in_range, _find_all_trains) testlari"""
+
+
+def _train(number="001", brand="Poyezd", dep="2030-01-10 08:30", cars=None):
+    return {
+        "number": number,
+        "brand": brand,
+        "departureDate": dep,
+        "arrivalDate": "2030-01-10 12:00",
+        "cars": cars if cars is not None else [],
+    }
+
+
+def _car(ctype="Ўриндиқ", free=5, price=100_000, tariff_seats=None):
+    return {
+        "type": ctype,
+        "freeSeats": free,
+        "tariffs": [{
+            "tariff": price,
+            "freeSeats": tariff_seats if tariff_seats is not None else free,
+            "classServiceType": ctype,
+        }],
+    }
+
+
+class TestTimeInRange:
+    def test_full_day_always_true(self, bot_module):
+        assert bot_module._time_in_range("2030-01-10 03:15", "00:00", "23:59") is True
+
+    def test_inside_range(self, bot_module):
+        assert bot_module._time_in_range("2030-01-10 08:30", "06:00", "11:59") is True
+
+    def test_outside_range(self, bot_module):
+        assert bot_module._time_in_range("2030-01-10 14:00", "06:00", "11:59") is False
+
+    def test_overnight_range(self, bot_module):
+        # 22:00–02:00 oralig'i yarim tundan o'tadi
+        assert bot_module._time_in_range("2030-01-10 23:30", "22:00", "02:00") is True
+        assert bot_module._time_in_range("2030-01-10 01:00", "22:00", "02:00") is True
+        assert bot_module._time_in_range("2030-01-10 12:00", "22:00", "02:00") is False
+
+    def test_malformed_date_passes(self, bot_module):
+        # buzilgan sana filtrni bloklamasligi kerak
+        assert bot_module._time_in_range("nonsense", "06:00", "11:59") is True
+
+
+class TestFindAllTrains:
+    def test_any_type_returns_all_with_seats(self, bot_module):
+        trains = [_train(cars=[_car()])]
+        found = bot_module._find_all_trains(trains, "any")
+        assert len(found) == 1
+
+    def test_no_cars_skipped(self, bot_module):
+        trains = [_train(cars=[])]
+        assert bot_module._find_all_trains(trains, "any") == []
+
+    def test_zero_seats_skipped(self, bot_module):
+        trains = [_train(cars=[_car(free=0)])]
+        assert bot_module._find_all_trains(trains, "any") == []
+
+    def test_zero_tariff_seats_skipped(self, bot_module):
+        trains = [_train(cars=[_car(free=3, tariff_seats=0)])]
+        assert bot_module._find_all_trains(trains, "any") == []
+
+    def test_price_cap(self, bot_module):
+        trains = [_train(cars=[_car(price=200_000)])]
+        assert bot_module._find_all_trains(trains, "any", max_price=150_000) == []
+        assert len(bot_module._find_all_trains(trains, "any", max_price=250_000)) == 1
+
+    def test_car_type_keyword_filter(self, bot_module):
+        trains = [_train(cars=[_car(ctype="Купе"), _car(ctype="Ўриндиқ")])]
+        found = bot_module._find_all_trains(trains, "platskar")
+        assert len(found) == 1
+        assert found[0][4] == "Ўриндиқ"
+
+    def test_brand_filter_afrosiyob(self, bot_module):
+        trains = [
+            _train(number="778", brand="Afrosiyob", cars=[_car(ctype="Econom")]),
+            _train(number="001", brand="Oddiy", cars=[_car(ctype="Econom")]),
+        ]
+        found = bot_module._find_all_trains(trains, "afrosiyob")
+        assert len(found) == 1
+        assert found[0][0]["number"] == "778"
+
+    def test_time_range_filter(self, bot_module):
+        trains = [
+            _train(number="M", dep="2030-01-10 07:00", cars=[_car()]),
+            _train(number="E", dep="2030-01-10 20:00", cars=[_car()]),
+        ]
+        found = bot_module._find_all_trains(trains, "any", time_from="06:00", time_to="11:59")
+        assert [f[0]["number"] for f in found] == ["M"]
