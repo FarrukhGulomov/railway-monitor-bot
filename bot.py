@@ -485,6 +485,20 @@ async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+def _monitor_admin_line(idx: int, m: dict) -> str:
+    price = f"{m['max_price']:,} so'm" if m.get("max_price") else "cheksiz"
+    status = "🟢 faol" if m.get("active") else "⚪ tugagan"
+    return (
+        f"{idx}. {status} | 🚉 {m.get('from_name','?')} → {m.get('to_name','?')}\n"
+        f"    📅 {m.get('date','—')} | ⏰ {m.get('time_from','00:00')}–{m.get('time_to','23:59')}\n"
+        f"    🚂 {CAR_TYPES.get(m.get('car_type','any'), m.get('car_type',''))} | 💰 {price}\n"
+        f"    🔄 {m.get('check_count', 0)} marta tekshirildi | 🕐 tanlagan: {_fmt_dt(m.get('created_at'))}"
+    )
+
+
+MAX_ADMIN_MONITORS_SHOWN = 12
+
+
 async def usr_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -498,7 +512,9 @@ async def usr_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("❌ Topilmadi.")
         return
     stats = db.get_user_monitor_stats(tid)
-    await q.edit_message_text(
+    monitors = db.get_user_monitors(tid)
+
+    text = (
         f"👤 *Foydalanuvchi:* `{tid}`\n"
         f"📛 Ism: {escape_markdown(u.get('first_name') or '—')}\n"
         f"📞 Tel: {escape_markdown(u.get('phone') or '—')}\n"
@@ -506,7 +522,20 @@ async def usr_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🕐 Oxirgi faollik: {_fmt_dt(u.get('last_seen'))}\n"
         f"🔢 Amallar soni: {u.get('action_count', 0)}\n"
         f"📊 Kuzatuvlar: {stats['active']} faol / {stats['total']} jami\n"
-        f"🔄 Jami tekshiruvlar: {stats['total_checks']}",
+        f"🔄 Jami tekshiruvlar: {stats['total_checks']}"
+    )
+
+    if monitors:
+        shown = monitors[:MAX_ADMIN_MONITORS_SHOWN]
+        text += "\n\n📋 *Tanlagan yo'nalishlari:*\n\n"
+        text += "\n\n".join(_monitor_admin_line(i, m) for i, m in enumerate(shown, 1))
+        if len(monitors) > MAX_ADMIN_MONITORS_SHOWN:
+            text += f"\n\n… yana {len(monitors) - MAX_ADMIN_MONITORS_SHOWN} ta kuzatuv bor"
+    else:
+        text += "\n\n📭 Hali birorta kuzatuv qo'shmagan."
+
+    await q.edit_message_text(
+        text,
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("🗑 Botdan o'chirish", callback_data=f"usr_del|{tid}")],
