@@ -231,6 +231,13 @@ class Database:
                 data["users"][key]["action_count"] = data["users"][key].get("action_count", 0) + 1
                 self._write(data)
 
+    def get_user_monitors(self, tid: int) -> list:
+        """Foydalanuvchining barcha kuzatuvlari (faol + tugagan), yangisi birinchi"""
+        with _lock:
+            data = self._read()
+        monitors = [m for m in data["monitors"].values() if m.get("uid") == tid]
+        return sorted(monitors, key=lambda m: m.get("created_at") or "", reverse=True)
+
     def get_user_monitor_stats(self, tid: int) -> dict:
         """Foydalanuvchining kuzatuvlar bo'yicha statistikasi"""
         with _lock:
