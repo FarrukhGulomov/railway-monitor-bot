@@ -88,6 +88,12 @@ class TestFindAllTrains:
         found = bot_module._find_all_trains(trains, "sv")
         assert len(found) == 1
 
+    def test_sv_matches_lux_spelling(self, bot_module):
+        # 054Ф reysida API vagon turini "Lux" deb ham qaytargani prod loglarida qayd etildi
+        trains = [_train(cars=[_car(ctype="Lux")])]
+        found = bot_module._find_all_trains(trains, "sv")
+        assert len(found) == 1
+
     def test_platskar_matches_real_api_spellings(self, bot_module):
         # Haqiqiy API "Plaskartli" (lotin) yoki "Плацкартный" (kirill) deb qaytaradi
         trains = [_train(cars=[_car(ctype="Plaskartli")])]
