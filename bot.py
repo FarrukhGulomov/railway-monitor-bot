@@ -71,9 +71,9 @@ CAR_TYPES = {
 }
 
 CAR_TYPE_KEYWORDS = {
-    "platskar":  ["o'rindiq", "ўриндиқ", "platskart", "seat"],
+    "platskar":  ["o'rindiq", "ўриндиқ", "platskart", "plaskart", "плацкарт", "seat"],
     "coupe":     ["yotoq", "ётоқ", "kupe", "купе", "compart"],
-    "sv":        ["sv", "lyuks", "люкс", "vip"],
+    "sv":        ["sv", "св", "lyuks", "люкс", "vip"],
     "afrosiyob": [],
     "sharq":     [],
     "any":       [],
