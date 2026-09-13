@@ -9,7 +9,7 @@ import os
 import time
 import fcntl
 import calendar
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 from telegram import (
@@ -1184,18 +1184,31 @@ async def _monitor_loop(uid: int, mid: str, data: dict, app):
     while db.is_active(mid):
         sleep_duration = Config.CHECK_INTERVAL
         try:
-            # Sana o'tib ketganmi tekshirish
+            # Sana/vaqt oralig'i o'tib ketganmi tekshirish — sana bugun bo'lsa-da,
+            # belgilangan vaqt oralig'i (time_to) allaqachon o'tib ketgan bo'lishi
+            # mumkin, bu holda ham qidirishning ma'nosi yo'q.
             try:
-                mon_date = datetime.strptime(data["date"], "%Y-%m-%d").date()
-                if mon_date < datetime.now().date():
+                mon_dt = datetime.strptime(data["date"], "%Y-%m-%d")
+                time_from_str = data.get("time_from", "00:00")
+                time_to_str = data.get("time_to", "23:59")
+                try:
+                    f_h, f_m = map(int, time_from_str.split(":"))
+                    t_h, t_m = map(int, time_to_str.split(":"))
+                except Exception:
+                    f_h, f_m, t_h, t_m = 0, 0, 23, 59
+                mon_end = mon_dt.replace(hour=t_h, minute=t_m)
+                if (f_h, f_m) > (t_h, t_m):
+                    mon_end += timedelta(days=1)  # kechayarim oshadigan oraliq
+                if datetime.now() > mon_end:
                     await app.bot.send_message(
                         uid,
-                        f"⚠️ Kuzatuv to'xtatildi — sana ({data['date']}) o'tib ketdi.\n"
+                        f"⚠️ Kuzatuv to'xtatildi — belgilangan sana/vaqt "
+                        f"({data['date']} {time_from_str}–{time_to_str}) o'tib ketdi.\n"
                         f"🆔 `{mid}`",
                         parse_mode="Markdown",
                     )
                     db.deactivate(mid)
-                    logger.info(f"Sana o'tib ketgani uchun to'xtatildi: mid={mid}")
+                    logger.info(f"Vaqt o'tib ketgani uchun to'xtatildi: mid={mid}")
                     return
             except ValueError:
                 pass
