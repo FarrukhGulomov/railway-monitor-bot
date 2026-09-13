@@ -154,3 +154,48 @@ class TestResilience:
         db = Database(path=str(path))
         assert db.get_users() == []
         assert db.add_user(1, added_by=2) is True
+
+    def test_corrupt_file_is_backed_up_not_silently_lost(self, tmp_path):
+        # audit P0#4: buzilgan faylni ustidan yozib, ma'lumotni yo'qotib
+        # qo'ymasdan, forensik nusxasini saqlashi kerak
+        from database import Database
+        path = tmp_path / "data.json"
+        path.write_text('{"monitors": {"x": {broken', encoding="utf-8")
+        db = Database(path=str(path))
+        db.get_active_monitors(1)  # _read() ni ishga tushiradi
+        backups = list(tmp_path.glob("data.json.corrupt-*"))
+        assert len(backups) == 1
+        assert backups[0].read_text(encoding="utf-8") == '{"monitors": {"x": {broken'
+
+    def test_corrupt_file_backed_up_only_once(self, tmp_path):
+        from database import Database
+        path = tmp_path / "data.json"
+        path.write_text("{not json", encoding="utf-8")
+        db = Database(path=str(path))
+        db.get_active_monitors(1)
+        db.get_users()
+        db.get_active_monitors(1)
+        backups = list(tmp_path.glob("data.json.corrupt-*"))
+        assert len(backups) == 1
+
+
+class TestWriteFailurePropagation:
+    """audit P0#4: DB yozuvi muvaffaqiyatsiz bo'lsa, chaqiruvchi kod buni
+    bilishi kerak — foydalanuvchiga soxta 'muvaffaqiyat' aytilmasligi uchun."""
+
+    MON = {
+        "from_name": "A", "from_code": "1", "to_name": "B", "to_code": "2",
+        "date": "2030-01-01", "car_type": "any", "active": True,
+    }
+
+    def test_save_monitor_returns_none_on_write_failure(self, db, monkeypatch):
+        monkeypatch.setattr(db, "_write", lambda data: False)
+        assert db.save_monitor(100, dict(self.MON)) is None
+
+    def test_update_monitor_field_returns_false_on_write_failure(self, db, monkeypatch):
+        mid = db.save_monitor(100, dict(self.MON))
+        monkeypatch.setattr(db, "_write", lambda data: False)
+        assert db.update_monitor_field(100, mid, "max_price", 1) is False
+
+    def test_write_returns_true_on_success(self, db):
+        assert db._write({"monitors": {}, "users": {}}) is True

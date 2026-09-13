@@ -5,6 +5,7 @@ Thread-safe, xavfsiz
 
 import json
 import os
+import shutil
 import uuid
 import threading
 import logging
@@ -21,6 +22,7 @@ class Database:
     def __init__(self, path: Optional[str] = None):
         if path:
             self.FILE = path
+        self._corrupt_backed_up = False
         self._ensure_file()
 
     def _ensure_file(self):
@@ -33,6 +35,12 @@ class Database:
         try:
             with open(self.FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
+        except json.JSONDecodeError as e:
+            # Fayl buzilgan — jim tarzda bo'sh baza sifatida qabul qilib, keyingi
+            # yozuvda ustidan yozib yubormaymiz. Avval forensik nusxa saqlaymiz.
+            logger.critical(f"DB fayli buzilgan (JSON parse xato): {e}")
+            self._backup_corrupt_file()
+            data = {}
         except Exception as e:
             logger.error(f"DB read xato: {e}")
             data = {}
@@ -40,23 +48,45 @@ class Database:
         data.setdefault("users", {})
         return data
 
-    def _write(self, data: dict):
+    def _backup_corrupt_file(self):
+        """Buzilgan faylni (jarayon davomida bir marta) zaxiralaydi — shu orqali
+        admin ma'lumotni qo'lda tiklay oladi, aks holda keyingi yozuv uni butunlay
+        yo'qotib qo'yardi."""
+        if self._corrupt_backed_up or not os.path.exists(self.FILE):
+            return
+        self._corrupt_backed_up = True
+        backup_path = f"{self.FILE}.corrupt-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        try:
+            shutil.copy2(self.FILE, backup_path)
+            logger.critical(f"Buzilgan DB fayli zaxiralandi: {backup_path}")
+        except Exception as e:
+            logger.error(f"Buzilgan faylni zaxiralab bo'lmadi: {e}")
+
+    def _write(self, data: dict) -> bool:
+        """`True` — yozuv muvaffaqiyatli. Chaqiruvchi kod `False` ni jim
+        yutmasligi, foydalanuvchiga soxta 'muvaffaqiyat' demasligi kerak."""
         try:
             # Avval tmp faylga yoz, keyin rename — atomic write
             tmp = self.FILE + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
             os.replace(tmp, self.FILE)
+            return True
         except Exception as e:
             logger.error(f"DB write xato: {e}")
+            return False
 
     # ─── Monitors ───────────────────────────────────────────────────────────────
-    def save_monitor(self, uid: int, monitor: dict) -> str:
+    def save_monitor(self, uid: int, monitor: dict) -> Optional[str]:
+        """Muvaffaqiyatli saqlansa monitor ID, DB yozuvi muvaffaqiyatsiz bo'lsa
+        `None` qaytaradi — chaqiruvchi kod bu holda foydalanuvchiga
+        "kuzatuv boshlandi" deb yolg'on aytmasligi kerak."""
         mid = uuid.uuid4().hex[:8]
         with _lock:
             data = self._read()
             data["monitors"][mid] = {**monitor, "id": mid, "uid": uid}
-            self._write(data)
+            if not self._write(data):
+                return None
         return mid
 
     def get_active_monitors(self, uid: int) -> list:
@@ -144,8 +174,7 @@ class Database:
             if m and m.get("uid") == uid:
                 m[field] = value
                 m["updated_at"] = datetime.now().isoformat()
-                self._write(data)
-                return True
+                return self._write(data)
         return False
 
     # ─── Users (admin tomonidan qo'shilgan foydalanuvchilar) ───────────────────────

@@ -108,3 +108,32 @@ class TestFindAllTrains:
         ]
         found = bot_module._find_all_trains(trains, "any", time_from="06:00", time_to="11:59")
         assert [f[0]["number"] for f in found] == ["M"]
+
+
+class TestTrainFingerprint:
+    """audit P0#2: bir xil joy keyingi tekshiruvda qayta 'yangi' deb
+    hisoblanmasligi kerak — fingerprint shu solishtirishning asosi."""
+
+    def test_same_train_same_fingerprint(self, bot_module):
+        trains = [_train(cars=[_car(price=100_000)])]
+        found1 = bot_module._find_all_trains(trains, "any")
+        found2 = bot_module._find_all_trains(trains, "any")
+        assert bot_module._train_fingerprint(found1[0]) == bot_module._train_fingerprint(found2[0])
+
+    def test_different_price_different_fingerprint(self, bot_module):
+        cheap = bot_module._find_all_trains(
+            [_train(cars=[_car(price=100_000)])], "any"
+        )[0]
+        expensive = bot_module._find_all_trains(
+            [_train(cars=[_car(price=200_000)])], "any"
+        )[0]
+        assert bot_module._train_fingerprint(cheap) != bot_module._train_fingerprint(expensive)
+
+    def test_different_train_number_different_fingerprint(self, bot_module):
+        a = bot_module._find_all_trains(
+            [_train(number="001", cars=[_car()])], "any"
+        )[0]
+        b = bot_module._find_all_trains(
+            [_train(number="002", cars=[_car()])], "any"
+        )[0]
+        assert bot_module._train_fingerprint(a) != bot_module._train_fingerprint(b)

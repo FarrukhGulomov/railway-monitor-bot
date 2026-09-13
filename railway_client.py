@@ -4,9 +4,11 @@ curl_cffi orqali — Chrome TLS fingerprint taqlid qiladi
 """
 
 import logging
+import threading
 import time
 import os
 import uuid
+from dataclasses import dataclass, field
 from urllib.parse import unquote
 from curl_cffi import requests as cffi_requests
 
@@ -25,6 +27,15 @@ HEADERS = {
 }
 
 
+@dataclass
+class SearchResult:
+    """So'rov natijasi — muvaffaqiyatli bo'sh natija bilan API/tarmoq xatosini
+    ajratish uchun. `ok=False` HECH QACHON "bilet yo'q" deb talqin qilinmasligi kerak."""
+    ok: bool
+    trains: list = field(default_factory=list)
+    error: str = ""
+
+
 class RailwayClient:
     TIMEOUT = 20
     MAX_RETRIES = 3
@@ -34,11 +45,15 @@ class RailwayClient:
         self._session = cffi_requests.Session(impersonate="chrome124")
         self._session.headers.update(HEADERS)
         self._last_request = 0.0
+        # Bitta client bir nechta monitor coroutine'lari orasida (turli threadlardan,
+        # asyncio.to_thread orqali) bo'lishilishi mumkin — so'rovlarni serializatsiya
+        # qilib, saytga bir vaqtda parallel zarba berilishining oldini oladi.
+        self._request_lock = threading.Lock()
 
         proxy_url = os.getenv("PROXY_URL", "").strip()
         if proxy_url:
             self._session.proxies = {"http": proxy_url, "https": proxy_url}
-            logger.info(f"Proxy: {proxy_url}")
+            logger.info("Proxy sozlandi")
 
         self._init_session()
 
@@ -89,7 +104,17 @@ class RailwayClient:
             time.sleep(self.MIN_INTERVAL - elapsed)
         self._last_request = time.time()
 
-    def search_trains(self, from_code: str, to_code: str, date: str) -> list:
+    def search_trains(self, from_code: str, to_code: str, date: str) -> SearchResult:
+        """railway.uz'dan poyezdlarni qidiradi.
+
+        MUHIM: `ok=False` — so'rov muvaffaqiyatsiz bo'lganini bildiradi (tarmoq/API
+        xatosi), bu "bilet/joy yo'q" degani EMAS. Faqat `ok=True, trains=[]` haqiqiy
+        bo'sh natijani anglatadi. Chaqiruvchi kod bularni aralashtirmasligi kerak.
+        """
+        with self._request_lock:
+            return self._search_trains_locked(from_code, to_code, date)
+
+    def _search_trains_locked(self, from_code: str, to_code: str, date: str) -> SearchResult:
         self._throttle()
 
         payload = {
@@ -102,6 +127,8 @@ class RailwayClient:
             }
         }
 
+        last_error = "noma'lum xato"
+
         for attempt in range(1, self.MAX_RETRIES + 1):
             try:
                 r = self._session.post(SEARCH_URL, json=payload, timeout=self.TIMEOUT)
@@ -110,6 +137,7 @@ class RailwayClient:
                 if r.status_code == 401:
                     logger.info("401 — session yangilanmoqda")
                     self._init_session()
+                    last_error = "401 unauthorized"
                     continue
 
                 if r.status_code == 403:
@@ -117,8 +145,9 @@ class RailwayClient:
                     if "CSRF" in r.text and attempt < self.MAX_RETRIES:
                         self._session.cookies.clear()
                         self._init_session()
+                        last_error = "403 csrf"
                         continue
-                    return []
+                    return SearchResult(False, [], "403 forbidden")
 
                 if r.status_code == 400:
                     error_body = r.text[:200]
@@ -133,28 +162,31 @@ class RailwayClient:
                             "Sayt backendi vaqtincha javob bermayapti "
                             "(Express xizmati). Keyingi tsiklda qayta sinab ko'riladi."
                         )
-                        return []
+                        return SearchResult(False, [], "express_temp_unavailable")
 
                     if "Unexpected status" in error_body:
                         logger.warning(
                             f"Sayt bu sanani ({date}) qabul qilmayapti. "
                             "Sabab: barcha reyslar o'tib ketgan bo'lishi yoki "
-                            "sana formatida muammo bo'lishi mumkin."
+                            "sana formatida muammo bo'lishi mumkin — buni ishonchli "
+                            "'bilet yo'q' deb bo'lmaydi, xato sifatida qaytariladi."
                         )
-                        return []
+                        return SearchResult(False, [], "unexpected_status")
 
                     self._init_session()
+                    last_error = f"400: {error_body}"
                     continue
 
                 if r.status_code == 429:
                     wait = min(int(r.headers.get("Retry-After", 30)), 30)
                     logger.warning(f"Rate limit — {wait}s")
                     time.sleep(wait)
+                    last_error = "429 rate limited"
                     continue
 
                 if r.status_code != 200:
                     logger.error(f"Status {r.status_code}: {r.text[:200]}")
-                    return []
+                    return SearchResult(False, [], f"http_{r.status_code}")
 
                 data = r.json()
                 trains = (
@@ -165,11 +197,12 @@ class RailwayClient:
                 )
 
                 logger.info(f"✅ {from_code}→{to_code} {date} — {len(trains)} poyezd topildi")
-                return trains
+                return SearchResult(True, trains, "")
 
             except Exception as e:
                 logger.error(f"Search xato (urinish {attempt}): {e}")
+                last_error = f"exception: {e}"
                 if attempt < self.MAX_RETRIES:
                     time.sleep(3)
 
-        return []
+        return SearchResult(False, [], last_error)

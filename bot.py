@@ -23,7 +23,7 @@ from telegram.ext import (
 )
 
 from config import Config
-from railway_client import RailwayClient
+from railway_client import RailwayClient, SearchResult
 from database import Database
 from security import SecurityMiddleware
 
@@ -100,6 +100,81 @@ LOCK_FILE = "/tmp/railway_bot.lock"
 
 db = Database(path=os.path.join(Config.DATA_DIR, "data.json"))
 security = SecurityMiddleware()
+
+# ─── Markaziy Railway API koordinatori ───────────────────────────────────────────
+# Har bir monitor o'zining alohida RailwayClient'ini ochib, bir vaqtda parallel
+# so'rov yuborishining oldini olish uchun: bitta umumiy client (ichida so'rovlarni
+# serializatsiya qiluvchi lock bilan) + bir xil marshrut/sana so'rovlarini qisqa
+# vaqt oynasida birlashtiruvchi (single-flight) keshni ishlatamiz.
+_railway_client: Optional[RailwayClient] = None
+_railway_client_lock = asyncio.Lock()
+
+_SEARCH_CACHE_TTL = 8.0  # soniya — shu oyna ichida bir xil so'rov qayta yuborilmaydi
+_search_cache: dict = {}      # (from,to,date) -> (monotonic_ts, SearchResult)
+_search_inflight: dict = {}   # (from,to,date) -> asyncio.Future
+_search_coord_lock = asyncio.Lock()
+
+# Barcha faol monitor asyncio tasklari — graceful shutdown uchun kuzatiladi
+_monitor_tasks: dict = {}  # mid -> asyncio.Task
+
+
+async def _get_railway_client() -> RailwayClient:
+    global _railway_client
+    if _railway_client is None:
+        async with _railway_client_lock:
+            if _railway_client is None:
+                _railway_client = await asyncio.to_thread(RailwayClient)
+    return _railway_client
+
+
+async def _shared_search(client: RailwayClient, from_code: str, to_code: str, date: str) -> SearchResult:
+    """Bir nechta monitor bir xil marshrut+sanani deyarli bir vaqtda so'rasa,
+    faqat bitta haqiqiy HTTP so'rov yuboriladi, qolganlari natijani bo'lishadi."""
+    key = (from_code, to_code, date)
+    now = time.monotonic()
+
+    async with _search_coord_lock:
+        cached = _search_cache.get(key)
+        if cached and now - cached[0] < _SEARCH_CACHE_TTL:
+            return cached[1]
+        fut = _search_inflight.get(key)
+        owner = fut is None
+        if owner:
+            fut = asyncio.get_event_loop().create_future()
+            _search_inflight[key] = fut
+
+    if not owner:
+        return await fut
+
+    try:
+        result = await asyncio.to_thread(client.search_trains, from_code, to_code, date)
+    except Exception as e:
+        logger.error(f"Kutilmagan xato search_trains chaqiruvida: {e}")
+        result = SearchResult(False, [], f"exception: {e}")
+
+    async with _search_coord_lock:
+        _search_cache[key] = (time.monotonic(), result)
+        _search_inflight.pop(key, None)
+    if not fut.done():
+        fut.set_result(result)
+    return result
+
+
+def _spawn_monitor(uid: int, mid: str, monitor: dict, app) -> "asyncio.Task":
+    task = asyncio.create_task(_monitor_loop(uid, mid, monitor, app))
+    _monitor_tasks[mid] = task
+    task.add_done_callback(lambda t, mid=mid: _monitor_tasks.pop(mid, None))
+    return task
+
+
+async def _shutdown_monitors(app):
+    """Bot to'xtatilganda barcha monitor tasklarini tartibli yakunlash."""
+    tasks = list(_monitor_tasks.values())
+    for t in tasks:
+        t.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    logger.info(f"🛑 {len(tasks)} ta monitor vazifasi to'xtatildi (shutdown)")
 
 
 def is_admin(uid: int) -> bool:
@@ -767,6 +842,15 @@ async def _confirm_and_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "check_count": 0, "last_check": None,
     }
     mid = db.save_monitor(uid, monitor)
+    if mid is None:
+        # DB yozuvi muvaffaqiyatsiz bo'ldi — foydalanuvchiga yolg'on "boshlandi"
+        # demaymiz va monitor task'ini ishga tushirmaymiz (u DB'da yo'q).
+        logger.error(f"Monitor saqlanmadi (DB write xato): uid={uid}")
+        await update.message.reply_text(
+            "❌ Kuzatuvni saqlab bo'lmadi — serverda vaqtinchalik xatolik.\n"
+            "Iltimos, birozdan so'ng /monitor bilan qaytadan urinib ko'ring."
+        )
+        return
     price_text = f"{ud['max_price']:,} so'm" if ud.get("max_price") else "Cheksiz"
     await update.message.reply_text(
         f"✅ *Kuzatuv boshlandi!*\n\n"
@@ -779,7 +863,7 @@ async def _confirm_and_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "⏳ Hozirgi mavjud biletlar tekshirilmoqda...",
         parse_mode="Markdown",
     )
-    asyncio.create_task(_monitor_loop(uid, mid, monitor, context.application))
+    _spawn_monitor(uid, mid, monitor, context.application)
 
 
 # ─── /list — ko'rish, tahrirlash, o'chirish ─────────────────────────────────────
@@ -1018,13 +1102,28 @@ async def error_handler(update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ─── Monitor loop ────────────────────────────────────────────────────────────────
+MAX_CONSECUTIVE_ERRORS_BEFORE_NOTICE = 5
+MAX_ERROR_BACKOFF = 300  # soniya — API xatosi davom etsa kutish shu chegaradan oshmaydi
+
+
+def _train_fingerprint(found_item) -> str:
+    """Bitta topilgan variantni o'ziga xos aniqlaydi — xuddi shu joy keyingi
+    tekshiruvda ham bor bo'lsa, uni qayta 'yangi joy topildi' deb yubormaslik uchun."""
+    train, car, price, tariff_seats, service_type = found_item
+    return f"{train.get('number')}|{train.get('departureDate')}|{service_type}|{price}"
+
+
 async def _monitor_loop(uid: int, mid: str, data: dict, app):
-    client = await asyncio.to_thread(RailwayClient)
+    client = await _get_railway_client()
     logger.info(f"Monitor boshlandi: uid={uid} mid={mid}")
     first_run = True
     consecutive_empty_date_errors = 0
+    consecutive_errors = 0
+    error_notice_sent = False
+    seen_fingerprints: set = set()
 
     while db.is_active(mid):
+        sleep_duration = Config.CHECK_INTERVAL
         try:
             # Sana o'tib ketganmi tekshirish
             try:
@@ -1048,84 +1147,130 @@ async def _monitor_loop(uid: int, mid: str, data: dict, app):
             if current:
                 data = current
 
-            # Sinxron (bloklovchi) so'rovni alohida threadda bajaramiz —
-            # shunda bot va boshqa monitorlar to'xtab qolmaydi
-            trains = await asyncio.to_thread(
-                client.search_trains, data["from_code"], data["to_code"], data["date"]
-            )
+            # Umumiy koordinator orqali — bir xil marshrut+sanani so'rayotgan
+            # boshqa monitorlar bilan natija bo'lishiladi, alohida HTTP zarba bermaydi
+            result = await _shared_search(client, data["from_code"], data["to_code"], data["date"])
             db.increment_check(mid)
 
-            # Agar sayt doimiy bo'sh natija qaytarsa (sana o'tib ketgan yoki
-            # sayt backend xizmati vaqtincha ishlamayotgan bo'lishi mumkin)
-            if not trains:
-                consecutive_empty_date_errors += 1
-                if consecutive_empty_date_errors == 10:
-                    mon_date_str = data.get("date", "")
+            if not result.ok:
+                # Railway.uz bilan bog'lanish/API xatosi — bu HECH QACHON
+                # "joy/bilet yo'q" deb talqin qilinmaydi.
+                consecutive_errors += 1
+                consecutive_empty_date_errors = 0
+                logger.warning(
+                    f"mid={mid}: qidiruv muvaffaqiyatsiz ({result.error}), "
+                    f"ketma-ket xato={consecutive_errors}"
+                )
+                if consecutive_errors == MAX_CONSECUTIVE_ERRORS_BEFORE_NOTICE and not error_notice_sent:
                     await app.bot.send_message(
                         uid,
-                        f"⚠️ Diqqat: 10 marta ketma-ket natija kelmadi.\n"
-                        f"Ehtimol railway.uz sayti vaqtincha javob bermayapti, "
-                        f"yoki {mon_date_str} sanasi uchun reyslar tugagan.\n\n"
-                        f"Kuzatuv davom etadi — agar sayt tiklansa, "
-                        f"avtomatik aniqlanadi.\n🆔 `{mid}`",
+                        "⚠️ Railway.uz sayti bilan bog'lanishda vaqtinchalik muammo bor.\n"
+                        "Bu joy yo'qligini anglatmaydi — kuzatuvni davom ettiryapman, "
+                        f"tiklanishi bilan xabar beraman.\n🆔 `{mid}`",
                         parse_mode="Markdown",
                     )
-                    consecutive_empty_date_errors = 0  # qayta ogohlantirish uchun reset
+                    error_notice_sent = True
+                sleep_duration = min(
+                    Config.CHECK_INTERVAL * min(consecutive_errors, 5), MAX_ERROR_BACKOFF
+                )
             else:
-                consecutive_empty_date_errors = 0
+                if error_notice_sent:
+                    await app.bot.send_message(
+                        uid,
+                        f"✅ Railway.uz bilan bog'lanish tiklandi, kuzatuv normal davom etmoqda.\n🆔 `{mid}`",
+                        parse_mode="Markdown",
+                    )
+                    error_notice_sent = False
+                consecutive_errors = 0
 
-            found = _find_all_trains(
-                trains, data["car_type"], data.get("max_price"),
-                data.get("time_from", "00:00"), data.get("time_to", "23:59"),
-            )
+                trains = result.trains
 
-            if found:
-                link = "https://eticket.railway.uz"
-                header = (
-                    f"📋 *Hozirda mavjud biletlar ({len(found)} ta variant):*\n"
-                    if first_run else
-                    f"🎯 *Yangi joy topildi! ({len(found)} ta variant)*\n"
+                # Agar sayt doimiy bo'sh natija qaytarsa (sana o'tib ketgan yoki
+                # o'sha kunga reyslar tugagan bo'lishi mumkin)
+                if not trains:
+                    consecutive_empty_date_errors += 1
+                    if consecutive_empty_date_errors == 10:
+                        mon_date_str = data.get("date", "")
+                        await app.bot.send_message(
+                            uid,
+                            f"⚠️ Diqqat: 10 marta ketma-ket bo'sh natija.\n"
+                            f"Ehtimol {mon_date_str} sanasi uchun reyslar tugagan.\n\n"
+                            f"Kuzatuv davom etadi — joy chiqsa, avtomatik aniqlanadi.\n🆔 `{mid}`",
+                            parse_mode="Markdown",
+                        )
+                        consecutive_empty_date_errors = 0  # qayta ogohlantirish uchun reset
+                else:
+                    consecutive_empty_date_errors = 0
+
+                found = _find_all_trains(
+                    trains, data["car_type"], data.get("max_price"),
+                    data.get("time_from", "00:00"), data.get("time_to", "23:59"),
                 )
-                lines = [header]
-                prev_number = None
-                for train, car, price, tariff_seats, service_type in found:
-                    dep = train.get("departureDate", "")
-                    arr = train.get("arrivalDate", "")
-                    number = train.get("number", "")
-                    time_str = dep.split(" ")[1] if " " in dep else dep
-                    arr_str  = arr.split(" ")[1] if " " in arr else arr
-                    if number != prev_number:
-                        lines.append(f"🚂 *{train.get('brand','')} {number}*\n   ⏰ {time_str} → {arr_str}")
-                        prev_number = number
-                    lines.append(f"   💺 {service_type}: {tariff_seats} joy | 💰 {price:,} so'm")
 
-                lines.append(f"\n🚉 {data['from_name']} → {data['to_name']}")
-                lines.append(f"\n👉 [Bilet sotib olish]({link})")
-                if not first_run:
-                    lines.append(f"\n_Kuzatuv to'xtatildi: {mid}_")
+                if found:
+                    fingerprints = {_train_fingerprint(f) for f in found}
+                    new_fingerprints = fingerprints - seen_fingerprints
 
-                await app.bot.send_message(
-                    uid, "\n".join(lines),
-                    parse_mode="Markdown",
-                    disable_web_page_preview=True,
-                )
-                if not first_run:
-                    db.deactivate(mid)
-                    logger.info(f"Joy topildi, monitor to'xtatildi: mid={mid}")
-                    return
-            elif first_run:
-                await app.bot.send_message(
-                    uid,
-                    f"ℹ️ Hozircha mos bilet yo'q.\nHar 60 soniyada kuzatib boraman...\n🆔 `{mid}`",
-                    parse_mode="Markdown",
-                )
-            first_run = False
+                    if first_run or new_fingerprints:
+                        # Faqat birinchi safar hammasi, keyingi safarlarda faqat
+                        # HAQIQATAN yangi paydo bo'lgan variantlar ko'rsatiladi —
+                        # avvaldan mavjud bo'lgan joy qayta "yangi" deb yuborilmaydi.
+                        to_show = found if first_run else [
+                            f for f in found if _train_fingerprint(f) in new_fingerprints
+                        ]
+                        link = "https://eticket.railway.uz"
+                        header = (
+                            f"📋 *Hozirda mavjud biletlar ({len(to_show)} ta variant):*\n"
+                            if first_run else
+                            f"🎯 *Yangi joy topildi! ({len(to_show)} ta variant)*\n"
+                        )
+                        lines = [header]
+                        prev_number = None
+                        for train, car, price, tariff_seats, service_type in to_show:
+                            dep = train.get("departureDate", "")
+                            arr = train.get("arrivalDate", "")
+                            number = train.get("number", "")
+                            time_str = dep.split(" ")[1] if " " in dep else dep
+                            arr_str  = arr.split(" ")[1] if " " in arr else arr
+                            if number != prev_number:
+                                lines.append(f"🚂 *{train.get('brand','')} {number}*\n   ⏰ {time_str} → {arr_str}")
+                                prev_number = number
+                            lines.append(f"   💺 {service_type}: {tariff_seats} joy | 💰 {price:,} so'm")
 
+                        lines.append(f"\n🚉 {data['from_name']} → {data['to_name']}")
+                        lines.append(f"\n👉 [Bilet sotib olish]({link})")
+                        if not first_run:
+                            lines.append(f"\n_Kuzatuv to'xtatildi: {mid}_")
+
+                        await app.bot.send_message(
+                            uid, "\n".join(lines),
+                            parse_mode="Markdown",
+                            disable_web_page_preview=True,
+                        )
+                        seen_fingerprints |= fingerprints
+                        if not first_run:
+                            db.deactivate(mid)
+                            logger.info(f"Yangi joy topildi, monitor to'xtatildi: mid={mid}")
+                            return
+                    else:
+                        # Topilgan joylar avval ko'rsatilganlar bilan bir xil —
+                        # hech narsa o'zgarmagan, jim tekshirishda davom etamiz.
+                        seen_fingerprints |= fingerprints
+                elif first_run:
+                    await app.bot.send_message(
+                        uid,
+                        f"ℹ️ Hozircha mos bilet yo'q.\nHar {Config.CHECK_INTERVAL} soniyada kuzatib boraman...\n🆔 `{mid}`",
+                        parse_mode="Markdown",
+                    )
+                first_run = False
+
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.error(f"Monitor xato mid={mid}: {e}")
             first_run = False
 
-        await asyncio.sleep(Config.CHECK_INTERVAL)
+        await asyncio.sleep(sleep_duration)
 
     logger.info(f"Monitor tugadi: mid={mid}")
 
@@ -1206,7 +1351,7 @@ async def _resume_monitors(app):
         logger.info(f"🗑 {len(expired)} ta muddati o'tgan kuzatuv avtomatik o'chirildi")
     monitors = db.get_all_active_monitors()
     for m in monitors:
-        asyncio.create_task(_monitor_loop(m["uid"], m["id"], m, app))
+        _spawn_monitor(m["uid"], m["id"], m, app)
     if monitors:
         logger.info(f"♻️ {len(monitors)} ta faol kuzatuv restartdan keyin tiklandi")
 
@@ -1224,6 +1369,7 @@ def main():
         Application.builder()
         .token(Config.BOT_TOKEN)
         .post_init(_resume_monitors)
+        .post_shutdown(_shutdown_monitors)
         .build()
     )
 
