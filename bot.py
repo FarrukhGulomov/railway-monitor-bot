@@ -41,10 +41,10 @@ logger = logging.getLogger("railway_bot")
 # ─── States ─────────────────────────────────────────────────────────────────────
 (
     WAIT_FROM, WAIT_TO, WAIT_DATE,
-    WAIT_CAR_TYPE, WAIT_TIME_RANGE, WAIT_MAX_PRICE,
-) = range(6)
+    WAIT_CAR_TYPE, WAIT_TIME_RANGE, WAIT_MAX_PRICE, WAIT_MIN_SEATS,
+) = range(7)
 
-EDIT_MENU, EDIT_FIELD, EDIT_VALUE = range(6, 9)
+EDIT_MENU, EDIT_FIELD, EDIT_VALUE = range(7, 10)
 
 # ─── Konstantalar ───────────────────────────────────────────────────────────────
 STATIONS = {
@@ -348,11 +348,14 @@ def _station_keyboard(prefix: str, exclude: str = "") -> InlineKeyboardMarkup:
 def _monitor_summary(m: dict) -> str:
     price = f"{m['max_price']:,}" if m.get("max_price") else "∞"
     checks = m.get("check_count", 0)
+    min_seats = m.get("min_seats", 1)
+    seats_line = f"  🎟 Kamida {min_seats} ta joy\n" if min_seats > 1 else ""
     return (
         f"🆔 `{m['id']}`\n"
         f"  🚉 {m['from_name']} → {m['to_name']}\n"
         f"  📅 {m['date']} | ⏰ {m.get('time_from','00:00')}–{m.get('time_to','23:59')}\n"
         f"  🚂 {CAR_TYPES.get(m.get('car_type','any'), m.get('car_type',''))}\n"
+        f"{seats_line}"
         f"  💰 {price} so'm | 🔄 {checks} tekshirildi"
     )
 
@@ -563,10 +566,12 @@ async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def _monitor_admin_line(idx: int, m: dict) -> str:
     price = f"{m['max_price']:,} so'm" if m.get("max_price") else "cheksiz"
     status = "🟢 faol" if m.get("active") else "⚪ tugagan"
+    min_seats = m.get("min_seats", 1)
+    seats_text = f" | 🎟 {min_seats} joy" if min_seats > 1 else ""
     return (
         f"{idx}. {status} | 🚉 {m.get('from_name','?')} → {m.get('to_name','?')}\n"
         f"    📅 {m.get('date','—')} | ⏰ {m.get('time_from','00:00')}–{m.get('time_to','23:59')}\n"
-        f"    🚂 {CAR_TYPES.get(m.get('car_type','any'), m.get('car_type',''))} | 💰 {price}\n"
+        f"    🚂 {CAR_TYPES.get(m.get('car_type','any'), m.get('car_type',''))} | 💰 {price}{seats_text}\n"
         f"    🔄 {m.get('check_count', 0)} marta tekshirildi | 🕐 tanlagan: {_fmt_dt(m.get('created_at'))}"
     )
 
@@ -807,6 +812,9 @@ async def got_custom_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return WAIT_MAX_PRICE
 
 
+MAX_SEATS_LIMIT = 20
+
+
 @restricted
 async def got_max_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
@@ -821,6 +829,29 @@ async def got_max_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Kamida 10,000 so'm.")
             return WAIT_MAX_PRICE
     context.user_data["max_price"] = max_price
+    await update.message.reply_text(
+        "🎟 *Nechta joy kerak?*\n"
+        "Masalan, 2 kishi birga sayohat qilsangiz — `2` deb kiriting.\n"
+        "Shuncha (yoki ko'proq) joy bitta poyezd/sinfda chiqqandagina xabar beraman.\n\n"
+        "Yoki /skip — 1 ta joy yetarli:",
+        parse_mode="Markdown",
+    )
+    return WAIT_MIN_SEATS
+
+
+@restricted
+async def got_min_seats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    min_seats = 1
+    if text != "/skip":
+        if not text.isdigit() or int(text) < 1:
+            await update.message.reply_text("❌ Faqat musbat butun son yoki /skip", parse_mode="Markdown")
+            return WAIT_MIN_SEATS
+        min_seats = int(text)
+        if min_seats > MAX_SEATS_LIMIT:
+            await update.message.reply_text(f"❌ Ko'pi bilan {MAX_SEATS_LIMIT} ta.")
+            return WAIT_MIN_SEATS
+    context.user_data["min_seats"] = min_seats
     await _confirm_and_start(update, context)
     return ConversationHandler.END
 
@@ -838,6 +869,7 @@ async def _confirm_and_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "date": ud["date"], "car_type": ud["car_type"],
         "time_from": time_from, "time_to": time_to, "time_label": time_label,
         "max_price": ud.get("max_price"),
+        "min_seats": ud.get("min_seats", 1),
         "active": True, "created_at": datetime.now().isoformat(),
         "check_count": 0, "last_check": None,
     }
@@ -852,6 +884,7 @@ async def _confirm_and_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         return
     price_text = f"{ud['max_price']:,} so'm" if ud.get("max_price") else "Cheksiz"
+    min_seats = ud.get("min_seats", 1)
     await update.message.reply_text(
         f"✅ *Kuzatuv boshlandi!*\n\n"
         f"🚉 {ud['from_name']} → {ud['to_name']}\n"
@@ -859,6 +892,7 @@ async def _confirm_and_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f"🚂 {CAR_TYPES.get(ud['car_type'], ud['car_type'])}\n"
         f"⏰ {time_label}\n"
         f"💰 Maks: {price_text}\n"
+        f"🎟 Kamida: {min_seats} ta joy\n"
         f"🆔 `{mid}`\n\n"
         "⏳ Hozirgi mavjud biletlar tekshirilmoqda...",
         parse_mode="Markdown",
@@ -938,6 +972,7 @@ async def mgr_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("⏰ Vaqt oralig'i", callback_data=f"mgr_ef|time|{mid}")],
             [InlineKeyboardButton("🚂 Vagon turi",    callback_data=f"mgr_ef|car|{mid}")],
             [InlineKeyboardButton("💰 Maks narx",     callback_data=f"mgr_ef|price|{mid}")],
+            [InlineKeyboardButton("🎟 Joy soni",      callback_data=f"mgr_ef|seats|{mid}")],
             [InlineKeyboardButton("◀️ Orqaga",        callback_data=f"mgr_show|{mid}")],
         ]),
     )
@@ -983,6 +1018,10 @@ async def mgr_edit_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif field == "price":
         await q.edit_message_text(
             "💰 Yangi maksimal narx kiriting (so'm)\nYoki /skip — cheksiz:"
+        )
+    elif field == "seats":
+        await q.edit_message_text(
+            "🎟 Kamida nechta joy kerakligini kiriting\nYoki /skip — 1 ta:"
         )
 
 
@@ -1041,34 +1080,54 @@ async def mgr_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def mgr_price_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Narx tahrirlash text input"""
-    if context.user_data.get("edit_field") != "price":
+async def mgr_edit_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Narx yoki joy soni tahrirlash uchun matn kiritish"""
+    field = context.user_data.get("edit_field")
+    if field not in ("price", "seats"):
         return
     text = update.message.text.strip()
     mid = context.user_data.get("edit_mid")
     uid = update.effective_user.id
-    cleaned = text.replace(" ","").replace(",","")
-    if not cleaned.isdigit():
-        await update.message.reply_text("❌ Faqat raqam yoki /skip")
-        return
-    db.update_monitor_field(uid, mid, "max_price", int(cleaned))
-    await update.message.reply_text(f"✅ Narx yangilandi: {int(cleaned):,} so'm\n\n/list — ro'yxatga qaytish")
+
+    if field == "price":
+        cleaned = text.replace(" ","").replace(",","")
+        if not cleaned.isdigit():
+            await update.message.reply_text("❌ Faqat raqam yoki /skip")
+            return
+        db.update_monitor_field(uid, mid, "max_price", int(cleaned))
+        await update.message.reply_text(f"✅ Narx yangilandi: {int(cleaned):,} so'm\n\n/list — ro'yxatga qaytish")
+    else:  # seats
+        if not text.isdigit() or int(text) < 1:
+            await update.message.reply_text("❌ Faqat musbat butun son yoki /skip")
+            return
+        n = int(text)
+        if n > MAX_SEATS_LIMIT:
+            await update.message.reply_text(f"❌ Ko'pi bilan {MAX_SEATS_LIMIT} ta.")
+            return
+        db.update_monitor_field(uid, mid, "min_seats", n)
+        await update.message.reply_text(f"✅ Joy soni yangilandi: {n} ta\n\n/list — ro'yxatga qaytish")
+
     context.user_data.pop("edit_field", None)
     context.user_data.pop("edit_mid", None)
 
 
-async def mgr_price_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Narx tahrirlashda /skip — chekni olib tashlash.
+async def mgr_edit_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Narx/joy soni tahrirlashda /skip — standart qiymatga qaytarish.
     (Buyruqlar filters.TEXT ga tushmaydi, shuning uchun alohida handler kerak)"""
-    if context.user_data.get("edit_field") != "price":
+    field = context.user_data.get("edit_field")
+    if field not in ("price", "seats"):
         return
     mid = context.user_data.get("edit_mid")
     uid = update.effective_user.id
-    db.update_monitor_field(uid, mid, "max_price", None)
+    if field == "price":
+        db.update_monitor_field(uid, mid, "max_price", None)
+        msg = "✅ Narx cheki olib tashlandi."
+    else:
+        db.update_monitor_field(uid, mid, "min_seats", 1)
+        msg = "✅ Joy soni: 1 ta (standart)."
     context.user_data.pop("edit_field", None)
     context.user_data.pop("edit_mid", None)
-    await update.message.reply_text("✅ Narx cheki olib tashlandi.\n\n/list — ro'yxatga qaytish")
+    await update.message.reply_text(f"{msg}\n\n/list — ro'yxatga qaytish")
 
 
 # ─── /stop ──────────────────────────────────────────────────────────────────────
@@ -1205,6 +1264,7 @@ async def _monitor_loop(uid: int, mid: str, data: dict, app):
                 found = _find_all_trains(
                     trains, data["car_type"], data.get("max_price"),
                     data.get("time_from", "00:00"), data.get("time_to", "23:59"),
+                    data.get("min_seats", 1),
                 )
 
                 if found:
@@ -1293,11 +1353,14 @@ def _time_in_range(dep_date_str: str, t_from: str, t_to: str) -> bool:
         return True
 
 
-def _find_all_trains(trains, car_type, max_price=None, time_from="00:00", time_to="23:59"):
+def _find_all_trains(trains, car_type, max_price=None, time_from="00:00", time_to="23:59", min_seats=1):
     keywords    = CAR_TYPE_KEYWORDS.get(car_type, [])
     brand_kws   = BRAND_FILTERS.get(car_type)  # None bo'lsa brand filtri yo'q
     results = []
-    logger.info(f"Filtr: car_type={car_type}, vaqt={time_from}–{time_to}, max_price={max_price}, jami={len(trains)}")
+    logger.info(
+        f"Filtr: car_type={car_type}, vaqt={time_from}–{time_to}, "
+        f"max_price={max_price}, min_seats={min_seats}, jami={len(trains)}"
+    )
 
     for train in trains:
         dep    = train.get("departureDate", "")
@@ -1334,7 +1397,12 @@ def _find_all_trains(trains, car_type, max_price=None, time_from="00:00", time_t
                 if max_price is not None and price > max_price:
                     logger.info(f"  ⏭ {number} [{service_type}] — narx {price:,} > maks {max_price:,}")
                     continue
-                if tariff_seats <= 0:
+                if tariff_seats < min_seats:
+                    if tariff_seats > 0:
+                        logger.info(
+                            f"  ⏭ {number} [{service_type}] — {tariff_seats} joy, "
+                            f"kerakli {min_seats} tadan kam"
+                        )
                     continue
                 logger.info(f"  ✅ {number} [{service_type}] {dep} — {tariff_seats} joy, {price:,} so'm")
                 results.append((train, car, price, tariff_seats, service_type))
@@ -1392,6 +1460,10 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, got_max_price),
                 CommandHandler("skip", got_max_price),
             ],
+            WAIT_MIN_SEATS: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, got_min_seats),
+                CommandHandler("skip", got_min_seats),
+            ],
         },
         fallbacks=[
             CommandHandler("cancel", cmd_cancel),
@@ -1427,9 +1499,9 @@ def main():
     app.add_handler(CallbackQueryHandler(mgr_cal_pick,   pattern=r"^cal_pick\|"))
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND,
-        mgr_price_text,
+        mgr_edit_text,
     ))
-    app.add_handler(CommandHandler("skip", mgr_price_skip))
+    app.add_handler(CommandHandler("skip", mgr_edit_skip))
     app.add_handler(MessageHandler(filters.CONTACT, got_contact))
 
     app.add_error_handler(error_handler)

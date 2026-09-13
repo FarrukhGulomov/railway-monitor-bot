@@ -137,11 +137,122 @@ class TestPriceSkip:
         update, context = _make_update(uid=999), _make_context()
 
         # edit rejimida emas — hech narsa qilmaydi
-        asyncio.run(bot_module.mgr_price_skip(update, context))
+        asyncio.run(bot_module.mgr_edit_skip(update, context))
         assert fresh_db.get_active_monitors(999)[0]["max_price"] == 50000
 
         # edit rejimida — chekni olib tashlaydi
         context.user_data = {"edit_field": "price", "edit_mid": mid}
-        asyncio.run(bot_module.mgr_price_skip(update, context))
+        asyncio.run(bot_module.mgr_edit_skip(update, context))
         assert fresh_db.get_active_monitors(999)[0]["max_price"] is None
         assert "edit_field" not in context.user_data
+
+
+class TestSeatsEdit:
+    def test_skip_resets_min_seats_to_one(self, bot_module, fresh_db):
+        mid = fresh_db.save_monitor(999, {
+            "from_name": "A", "to_name": "B", "date": "2030-01-01",
+            "car_type": "any", "active": True, "min_seats": 3,
+        })
+        update, context = _make_update(uid=999), _make_context()
+        context.user_data = {"edit_field": "seats", "edit_mid": mid}
+
+        asyncio.run(bot_module.mgr_edit_skip(update, context))
+
+        assert fresh_db.get_active_monitors(999)[0]["min_seats"] == 1
+        assert "edit_field" not in context.user_data
+
+    def test_text_updates_min_seats(self, bot_module, fresh_db):
+        mid = fresh_db.save_monitor(999, {
+            "from_name": "A", "to_name": "B", "date": "2030-01-01",
+            "car_type": "any", "active": True, "min_seats": 1,
+        })
+        update, context = _make_update(uid=999), _make_context()
+        update.message.text = "2"
+        context.user_data = {"edit_field": "seats", "edit_mid": mid}
+
+        asyncio.run(bot_module.mgr_edit_text(update, context))
+
+        assert fresh_db.get_active_monitors(999)[0]["min_seats"] == 2
+        assert "edit_field" not in context.user_data
+
+    def test_text_rejects_non_positive_input(self, bot_module, fresh_db):
+        mid = fresh_db.save_monitor(999, {
+            "from_name": "A", "to_name": "B", "date": "2030-01-01",
+            "car_type": "any", "active": True, "min_seats": 1,
+        })
+        update, context = _make_update(uid=999), _make_context()
+        update.message.text = "0"
+        context.user_data = {"edit_field": "seats", "edit_mid": mid}
+
+        asyncio.run(bot_module.mgr_edit_text(update, context))
+
+        assert fresh_db.get_active_monitors(999)[0]["min_seats"] == 1
+        assert context.user_data.get("edit_field") == "seats"  # hali tugallanmagan
+
+
+class TestMonitorFlowSeats:
+    """/monitor oqimida narxdan keyin 'nechta joy kerak' bosqichi (audit: bitta
+    joy chiqishi bilanoq monitor to'xtab, 2+ joy izlagan foydalanuvchi
+    talabini qondirmasligi muammosi)."""
+
+    def _base_user_data(self):
+        return {
+            "from_name": "🏙 Toshkent", "from_code": "1",
+            "to_name": "🕌 Buxoro", "to_code": "2",
+            "date": "2099-01-01", "car_type": "any",
+            "time_from": "00:00", "time_to": "23:59", "time_label": "🕐 Istalgan vaqt",
+        }
+
+    def test_price_step_moves_to_seats_step_not_confirm(self, bot_module, fresh_db):
+        bot_module.Config.ADMIN_IDS = []
+        bot_module.Config.ALLOWED_USERS = []
+        update, context = _make_update(uid=999), _make_context()
+        update.message.text = "/skip"
+        context.user_data = self._base_user_data()
+
+        state = asyncio.run(bot_module.got_max_price(update, context))
+
+        assert state == bot_module.WAIT_MIN_SEATS
+        assert fresh_db.get_active_monitors(999) == []  # hali saqlanmagan
+        prompt = update.message.reply_text.await_args_list[0].args[0]
+        assert "joy" in prompt.lower()
+
+    def test_skip_seats_defaults_to_one_and_starts_monitor(self, bot_module, fresh_db, monkeypatch):
+        bot_module.Config.ADMIN_IDS = []
+        bot_module.Config.ALLOWED_USERS = []
+        monkeypatch.setattr(bot_module, "_spawn_monitor", lambda *a, **kw: None)
+        update, context = _make_update(uid=999), _make_context()
+        update.message.text = "/skip"
+        context.user_data = dict(self._base_user_data(), max_price=None)
+
+        state = asyncio.run(bot_module.got_min_seats(update, context))
+
+        assert state == bot_module.ConversationHandler.END
+        monitors = fresh_db.get_active_monitors(999)
+        assert len(monitors) == 1
+        assert monitors[0]["min_seats"] == 1
+
+    def test_explicit_seats_saved_on_monitor(self, bot_module, fresh_db, monkeypatch):
+        bot_module.Config.ADMIN_IDS = []
+        bot_module.Config.ALLOWED_USERS = []
+        monkeypatch.setattr(bot_module, "_spawn_monitor", lambda *a, **kw: None)
+        update, context = _make_update(uid=999), _make_context()
+        update.message.text = "2"
+        context.user_data = dict(self._base_user_data(), max_price=None)
+
+        asyncio.run(bot_module.got_min_seats(update, context))
+
+        monitors = fresh_db.get_active_monitors(999)
+        assert monitors[0]["min_seats"] == 2
+
+    def test_invalid_seats_input_rejected(self, bot_module, fresh_db):
+        bot_module.Config.ADMIN_IDS = []
+        bot_module.Config.ALLOWED_USERS = []
+        update, context = _make_update(uid=999), _make_context()
+        update.message.text = "0"
+        context.user_data = dict(self._base_user_data(), max_price=None)
+
+        state = asyncio.run(bot_module.got_min_seats(update, context))
+
+        assert state == bot_module.WAIT_MIN_SEATS
+        assert fresh_db.get_active_monitors(999) == []

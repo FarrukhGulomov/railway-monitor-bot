@@ -67,6 +67,21 @@ class TestFindAllTrains:
         assert bot_module._find_all_trains(trains, "any", max_price=150_000) == []
         assert len(bot_module._find_all_trains(trains, "any", max_price=250_000)) == 1
 
+    def test_min_seats_filters_out_insufficient_tariffs(self, bot_module):
+        # Foydalanuvchi 2 ta joy so'rasa, 1 tagina joy bor tarif ko'rsatilmasligi kerak
+        trains = [_train(cars=[_car(tariff_seats=1)])]
+        assert bot_module._find_all_trains(trains, "any", min_seats=2) == []
+
+    def test_min_seats_passes_when_enough(self, bot_module):
+        trains = [_train(cars=[_car(tariff_seats=3)])]
+        found = bot_module._find_all_trains(trains, "any", min_seats=2)
+        assert len(found) == 1
+        assert found[0][3] == 3
+
+    def test_min_seats_default_is_one(self, bot_module):
+        trains = [_train(cars=[_car(tariff_seats=1)])]
+        assert len(bot_module._find_all_trains(trains, "any")) == 1
+
     def test_car_type_keyword_filter(self, bot_module):
         trains = [_train(cars=[_car(ctype="Купе"), _car(ctype="Ўриндиқ")])]
         found = bot_module._find_all_trains(trains, "platskar")
