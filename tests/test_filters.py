@@ -82,6 +82,19 @@ class TestFindAllTrains:
         assert len(found) == 1
         assert found[0][0]["number"] == "778"
 
+    def test_sv_matches_cyrillic_type(self, bot_module):
+        # railway.uz API vagon turini kirillcha "СВ" deb qaytaradi
+        trains = [_train(cars=[_car(ctype="СВ")])]
+        found = bot_module._find_all_trains(trains, "sv")
+        assert len(found) == 1
+
+    def test_platskar_matches_real_api_spellings(self, bot_module):
+        # Haqiqiy API "Plaskartli" (lotin) yoki "Плацкартный" (kirill) deb qaytaradi
+        trains = [_train(cars=[_car(ctype="Plaskartli")])]
+        assert len(bot_module._find_all_trains(trains, "platskar")) == 1
+        trains = [_train(cars=[_car(ctype="Плацкартный")])]
+        assert len(bot_module._find_all_trains(trains, "platskar")) == 1
+
     def test_time_range_filter(self, bot_module):
         trains = [
             _train(number="M", dep="2030-01-10 07:00", cars=[_car()]),
