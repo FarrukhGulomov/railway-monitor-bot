@@ -1,5 +1,7 @@
 """Database qatlami testlari"""
 
+import os
+
 
 class TestUsers:
     def test_add_new_user(self, db):
@@ -197,5 +199,120 @@ class TestWriteFailurePropagation:
         monkeypatch.setattr(db, "_write", lambda data: False)
         assert db.update_monitor_field(100, mid, "max_price", 1) is False
 
+    def test_update_monitor_fields_atomic_all_or_nothing(self, db, monkeypatch):
+        mid = db.save_monitor(100, dict(self.MON, time_from="00:00", time_to="23:59"))
+        monkeypatch.setattr(db, "_write", lambda data: False)
+        ok = db.update_monitor_fields(100, mid, {"time_from": "10:00", "time_to": "12:00"})
+        assert ok is False
+        monkeypatch.undo()
+        m = db.get_active_monitors(100)[0]
+        # Yozuv muvaffaqiyatsiz bo'lgani uchun ESKI qiymatlar saqlanib qolgan —
+        # bitta maydon yangilanib, ikkinchisi eskicha qolib ketmagan (yarim holat yo'q).
+        assert m["time_from"] == "00:00"
+        assert m["time_to"] == "23:59"
+
+    def test_update_monitor_fields_success_updates_all_at_once(self, db):
+        mid = db.save_monitor(100, dict(self.MON, time_from="00:00", time_to="23:59"))
+        ok = db.update_monitor_fields(100, mid, {
+            "time_from": "10:00", "time_to": "12:00", "time_label": "custom",
+        })
+        assert ok is True
+        m = db.get_active_monitors(100)[0]
+        assert (m["time_from"], m["time_to"], m["time_label"]) == ("10:00", "12:00", "custom")
+
+    # ── add_user / remove_user — ruxsat berish/bekor qilish (xavfsizlik jihatidan MUHIM) ──
+    def test_add_user_new_returns_none_on_write_failure(self, db, monkeypatch):
+        monkeypatch.setattr(db, "_write", lambda data: False)
+        assert db.add_user(100, added_by=1) is None
+        assert db.is_added_user(100) is False  # ruxsat HAQIQATDA berilmagan
+
+    def test_add_user_reactivate_returns_none_on_write_failure(self, db, monkeypatch):
+        db.add_user(100, added_by=1)
+        db.remove_user(100)
+        monkeypatch.setattr(db, "_write", lambda data: False)
+        assert db.add_user(100, added_by=1) is None
+        assert db.is_added_user(100) is False  # hali o'chirilgan holatda qolishi kerak
+
+    def test_remove_user_returns_none_on_write_failure(self, db, monkeypatch):
+        db.add_user(100, added_by=1)
+        monkeypatch.setattr(db, "_write", lambda data: False)
+        assert db.remove_user(100) is None
+        monkeypatch.undo()
+        # Yozuv muvaffaqiyatsiz bo'lgani uchun ruxsat HALI HAM faol —
+        # chaqiruvchi kod "o'chirildi" deb yolg'on aytmasligi kerak edi.
+        assert db.is_added_user(100) is True
+
+    def test_set_user_phone_returns_none_on_write_failure(self, db, monkeypatch):
+        db.add_user(100, added_by=1)
+        monkeypatch.setattr(db, "_write", lambda data: False)
+        assert db.set_user_phone(100, "+998900000000") is None
+
+    def test_touch_user_activity_returns_false_on_write_failure(self, db, monkeypatch):
+        db.add_user(100, added_by=1)
+        monkeypatch.setattr(db, "_write", lambda data: False)
+        assert db.touch_user_activity(100) is False
+
+    def test_touch_user_activity_untracked_user_is_not_a_failure(self, db):
+        # Kuzatilmayotgan (DB'da yo'q) foydalanuvchi uchun yozadigan narsa
+        # yo'q — bu xato emas, True qaytarishi kerak.
+        assert db.touch_user_activity(999999) is True
+
+    # ── monitor to'xtatish/deaktivatsiya — ishonchlilik ──
+    def test_deactivate_returns_false_on_write_failure(self, db, monkeypatch):
+        mid = db.save_monitor(100, dict(self.MON))
+        monkeypatch.setattr(db, "_write", lambda data: False)
+        assert db.deactivate(mid) is False
+        monkeypatch.undo()
+        assert db.is_active(mid) is True  # hali faol — soxta "to'xtadi" yo'q
+
+    def test_deactivate_for_user_returns_none_on_write_failure(self, db, monkeypatch):
+        mid = db.save_monitor(100, dict(self.MON))
+        monkeypatch.setattr(db, "_write", lambda data: False)
+        assert db.deactivate_for_user(100, mid) is None
+        monkeypatch.undo()
+        assert db.is_active(mid) is True
+
+    def test_deactivate_for_user_not_found_is_false_not_none(self, db):
+        # "Topilmadi" holati "yozuv xatosi" holatidan farqlanishi kerak —
+        # chaqiruvchi kod ikkalasiga ham har xil xabar ko'rsatadi.
+        assert db.deactivate_for_user(100, "yoq-bunday-id") is False
+
+    def test_deactivate_all_returns_none_on_write_failure(self, db, monkeypatch):
+        db.save_monitor(100, dict(self.MON))
+        db.save_monitor(100, dict(self.MON))
+        monkeypatch.setattr(db, "_write", lambda data: False)
+        assert db.deactivate_all(100) is None
+        monkeypatch.undo()
+        assert len(db.get_active_monitors(100)) == 2  # hech biri to'xtamagan
+
+    def test_deactivate_all_zero_monitors_is_not_a_failure(self, db):
+        # Hech qanday faol kuzatuv yo'q holat — bu "yozuv xatosi" emas, 0.
+        assert db.deactivate_all(100) == 0
+
+    def test_increment_check_returns_false_on_write_failure(self, db, monkeypatch):
+        mid = db.save_monitor(100, dict(self.MON))
+        monkeypatch.setattr(db, "_write", lambda data: False)
+        assert db.increment_check(mid) is False
+
+    def test_deactivate_expired_returns_empty_on_write_failure(self, db, monkeypatch):
+        # audit: yozuv muvaffaqiyatsiz bo'lsa, hech narsa "o'chirildi" deb
+        # da'vo qilinmasligi kerak — bo'lmasa restart resume logikasi
+        # va foydalanuvchiga ko'rsatiladigan xabar noto'g'ri bo'lib qoladi.
+        db.save_monitor(100, dict(self.MON, date="2020-01-01"))
+        monkeypatch.setattr(db, "_write", lambda data: False)
+        assert db.deactivate_expired("2026-01-01") == []
+        monkeypatch.undo()
+        # Hali ham faol — yozuv muvaffaqiyatsiz bo'lgani uchun DBda o'zgarish yo'q
+        assert len(db.get_active_monitors(100)) == 1
+
     def test_write_returns_true_on_success(self, db):
         assert db._write({"monitors": {}, "users": {}}) is True
+
+    def test_write_cleans_up_tmp_file_on_failure(self, db, monkeypatch, tmp_path):
+        # Yozuv muvaffaqiyatsiz bo'lsa, yarim yozilgan .tmp fayl diskda
+        # qolib ketmasligi kerak (keyingi urinishga xalaqit bermasligi uchun).
+        def _boom(*a, **kw):
+            raise OSError("disk to'la")
+        monkeypatch.setattr("database.json.dump", _boom)
+        assert db._write({"monitors": {}, "users": {}}) is False
+        assert not os.path.exists(db.FILE + ".tmp")

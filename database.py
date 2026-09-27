@@ -65,15 +65,22 @@ class Database:
     def _write(self, data: dict) -> bool:
         """`True` — yozuv muvaffaqiyatli. Chaqiruvchi kod `False` ni jim
         yutmasligi, foydalanuvchiga soxta 'muvaffaqiyat' demasligi kerak."""
+        tmp = self.FILE + ".tmp"
         try:
             # Avval tmp faylga yoz, keyin rename — atomic write
-            tmp = self.FILE + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
             os.replace(tmp, self.FILE)
             return True
         except Exception as e:
             logger.error(f"DB write xato: {e}")
+            # Yarim yozilgan .tmp faylni qoldirmaymiz — keyingi urinishga xalaqit
+            # bermasin va diskni asossiz to'ldirmasin.
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
             return False
 
     # ─── Monitors ───────────────────────────────────────────────────────────────
@@ -105,7 +112,11 @@ class Database:
 
     def deactivate_expired(self, today: str) -> list:
         """Sanasi o'tib ketgan faol kuzatuvlarni avtomatik o'chirish.
-        `today` — YYYY-MM-DD; o'chirilgan kuzatuvlar ro'yxatini qaytaradi."""
+        `today` — YYYY-MM-DD; FAQAT diskka muvaffaqiyatli yozilgan holatda
+        o'chirilgan kuzatuvlar ro'yxatini qaytaradi. Yozuv muvaffaqiyatsiz
+        bo'lsa bo'sh ro'yxat qaytaradi — chaqiruvchi kod hech narsa
+        o'chirilmagan deb ishonchli hisoblashi mumkin (soxta "o'chirildi"
+        da'vosi yo'q)."""
         removed = []
         with _lock:
             data = self._read()
@@ -115,8 +126,14 @@ class Database:
                     m["stopped_at"] = datetime.now().isoformat()
                     m["stop_reason"] = "expired"
                     removed.append(dict(m))
-            if removed:
-                self._write(data)
+            if not removed:
+                return []
+            if not self._write(data):
+                logger.error(
+                    f"deactivate_expired: {len(removed)} ta yozuv muvaffaqiyatsiz — "
+                    "hech biri haqiqatda o'chirilmadi"
+                )
+                return []
         return removed
 
     def is_active(self, mid: str) -> bool:
@@ -124,26 +141,38 @@ class Database:
             data = self._read()
         return data["monitors"].get(mid, {}).get("active", False)
 
-    def deactivate(self, mid: str):
+    def deactivate(self, mid: str) -> bool:
+        """`True` — muvaffaqiyatli diskka yozildi. `False` — mid topilmadi
+        YOKI yozuv muvaffaqiyatsiz bo'ldi (chaqiruvchi buni farqlash kerak
+        bo'lsa, oldin `is_active(mid)` bilan tekshirsin)."""
         with _lock:
             data = self._read()
             if mid in data["monitors"]:
                 data["monitors"][mid]["active"] = False
                 data["monitors"][mid]["stopped_at"] = datetime.now().isoformat()
-                self._write(data)
+                return self._write(data)
+        return False
 
-    def deactivate_for_user(self, uid: int, mid: str) -> bool:
+    def deactivate_for_user(self, uid: int, mid: str) -> Optional[bool]:
+        """`True` — muvaffaqiyatli to'xtatildi va saqlandi.
+        `False` — topilmadi / bu foydalanuvchiga tegishli emas / allaqachon faol emas.
+        `None` — topildi va tegishli, lekin DISKKA YOZUV MUVAFFAQIYATSIZ bo'ldi —
+        chaqiruvchi kod bu holatda foydalanuvchiga "o'chirildi" deb YOLG'ON
+        aytmasligi, vaqtinchalik xatolik ko'rsatishi kerak."""
         with _lock:
             data = self._read()
             m = data["monitors"].get(mid)
             if m and m.get("uid") == uid and m.get("active"):
                 m["active"] = False
                 m["stopped_at"] = datetime.now().isoformat()
-                self._write(data)
-                return True
+                return True if self._write(data) else None
         return False
 
-    def deactivate_all(self, uid: int) -> int:
+    def deactivate_all(self, uid: int) -> Optional[int]:
+        """Muvaffaqiyatli to'xtatilgan kuzatuvlar sonini qaytaradi (0 — hech
+        qanday faol kuzatuv yo'q edi, bu xato emas). `None` — kamida bitta
+        kuzatuv topildi, lekin diskka yozib bo'lmadi — chaqiruvchi kod bu
+        holatda "N ta to'xtatildi" deb YOLG'ON aytmasligi kerak."""
         count = 0
         with _lock:
             data = self._read()
@@ -152,11 +181,15 @@ class Database:
                     m["active"] = False
                     m["stopped_at"] = datetime.now().isoformat()
                     count += 1
-            if count:
-                self._write(data)
-        return count
+            if count == 0:
+                return 0
+            return count if self._write(data) else None
 
-    def increment_check(self, mid: str):
+    def increment_check(self, mid: str) -> bool:
+        """Tekshiruv statistikasi — xavfsizlik jihatidan muhim emas (faqat
+        ko'rsatkich), shuning uchun chaqiruvchi (monitor loop) buni bloklovchi
+        xato sifatida ishlatmasligi kerak; baribir aniq kuzatish uchun natija
+        qaytariladi va muvaffaqiyatsizlik `_write` orqali log qilinadi."""
         with _lock:
             data = self._read()
             if mid in data["monitors"]:
@@ -164,23 +197,36 @@ class Database:
                     data["monitors"][mid].get("check_count", 0) + 1
                 )
                 data["monitors"][mid]["last_check"] = datetime.now().isoformat()
-                self._write(data)
+                return self._write(data)
+        return False
 
-    def update_monitor_field(self, uid: int, mid: str, field: str, value):
+    def update_monitor_field(self, uid: int, mid: str, field: str, value) -> bool:
         """Monitor bitta maydonini yangilash"""
+        return self.update_monitor_fields(uid, mid, {field: value})
+
+    def update_monitor_fields(self, uid: int, mid: str, fields: dict) -> bool:
+        """Bir nechta maydonni BITTA read-modify-write tranzaksiyada yangilash.
+        Bir nechta alohida `update_monitor_field` chaqiruvi o'rniga — shunda
+        vaqt oralig'i kabi (time_from/time_to/time_label) bir nechta maydon
+        qisman yozilib, nomuvofiq holatda qolib ketmaydi: yo hammasi
+        saqlanadi, yo hech biri."""
         with _lock:
             data = self._read()
             m = data["monitors"].get(mid)
             if m and m.get("uid") == uid:
-                m[field] = value
+                m.update(fields)
                 m["updated_at"] = datetime.now().isoformat()
                 return self._write(data)
         return False
 
     # ─── Users (admin tomonidan qo'shilgan foydalanuvchilar) ───────────────────────
-    def add_user(self, tid: int, added_by: int, username: str = "", first_name: str = "") -> bool:
+    def add_user(self, tid: int, added_by: int, username: str = "", first_name: str = "") -> Optional[bool]:
         """Foydalanuvchini ruxsat etilganlar ro'yxatiga qo'shish.
-        Qaytadi: True — yangi qo'shildi, False — allaqachon bor edi (faollashtirildi)."""
+        Qaytadi: `True` — yangi qo'shildi va saqlandi, `False` — allaqachon bor
+        edi va qayta faollashtirish saqlandi, `None` — DISKKA YOZUV
+        MUVAFFAQIYATSIZ bo'ldi (bu ruxsat berish — xavfsizlik jihatidan
+        muhim — chaqiruvchi kod bu holatda foydalanuvchiga "qo'shildi" deb
+        YOLG'ON aytmasligi kerak)."""
         with _lock:
             data = self._read()
             key = str(tid)
@@ -192,8 +238,7 @@ class Database:
                     existing["username"] = username
                 if first_name:
                     existing["first_name"] = first_name
-                self._write(data)
-                return False
+                return False if self._write(data) else None
             data["users"][key] = {
                 "tid": tid,
                 "username": username,
@@ -204,11 +249,16 @@ class Database:
                 "last_seen": None,
                 "action_count": 0,
             }
-            self._write(data)
-            return True
+            return True if self._write(data) else None
 
-    def remove_user(self, tid: int) -> bool:
-        """Foydalanuvchini botdan o'chirish (ruxsatini bekor qilish)"""
+    def remove_user(self, tid: int) -> Optional[bool]:
+        """Foydalanuvchini botdan o'chirish (ruxsatini bekor qilish).
+        Qaytadi: `True` — o'chirildi va saqlandi, `False` — topilmadi /
+        allaqachon o'chirilgan, `None` — DISKKA YOZUV MUVAFFAQIYATSIZ bo'ldi.
+        Ruxsatni bekor qilish xavfsizlik jihatidan muhim: chaqiruvchi kod
+        `None` holatida foydalanuvchini "o'chirilgan" deb HECH QACHON
+        ko'rsatmasligi kerak, aks holda ruxsat aslida diskda saqlanib qolgan
+        bo'lishi mumkin."""
         with _lock:
             data = self._read()
             key = str(tid)
@@ -216,8 +266,7 @@ class Database:
             if u and u.get("active"):
                 u["active"] = False
                 u["removed_at"] = datetime.now().isoformat()
-                self._write(data)
-                return True
+                return True if self._write(data) else None
         return False
 
     def is_added_user(self, tid: int) -> bool:
@@ -239,26 +288,31 @@ class Database:
             data = self._read()
         return data["users"].get(str(tid))
 
-    def set_user_phone(self, tid: int, phone: str) -> bool:
-        """Foydalanuvchi telefon raqamini saqlash (faqat ro'yxatda bo'lsa)"""
+    def set_user_phone(self, tid: int, phone: str) -> Optional[bool]:
+        """Foydalanuvchi telefon raqamini saqlash (faqat ro'yxatda bo'lsa).
+        `True` — saqlandi, `False` — foydalanuvchi ro'yxatda yo'q, `None` —
+        yozuv muvaffaqiyatsiz bo'ldi."""
         with _lock:
             data = self._read()
             u = data["users"].get(str(tid))
             if u:
                 u["phone"] = phone
-                self._write(data)
-                return True
+                return True if self._write(data) else None
         return False
 
-    def touch_user_activity(self, tid: int):
-        """Foydalanuvchi faolligini qayd qilish (oxirgi faollik, amallar soni)"""
+    def touch_user_activity(self, tid: int) -> bool:
+        """Foydalanuvchi faolligini qayd qilish (oxirgi faollik, amallar soni).
+        Faqat statistika — xavfsizlik jihatidan muhim emas, shuning uchun
+        muvaffaqiyatsizlik chaqiruvchi oqimni bloklamaydi, faqat `False`
+        qaytariladi (kuzatish/log uchun)."""
         with _lock:
             data = self._read()
             key = str(tid)
             if key in data["users"]:
                 data["users"][key]["last_seen"] = datetime.now().isoformat()
                 data["users"][key]["action_count"] = data["users"][key].get("action_count", 0) + 1
-                self._write(data)
+                return self._write(data)
+        return True  # kuzatilmayotgan foydalanuvchi — yozadigan narsa yo'q, xato emas
 
     def get_user_monitors(self, tid: int) -> list:
         """Foydalanuvchining barcha kuzatuvlari (faol + tugagan), yangisi birinchi"""

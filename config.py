@@ -2,10 +2,13 @@
 Konfiguratsiya — environment variables dan o'qiladi
 """
 
+import logging
 import os
 from dotenv import load_dotenv
 
 load_dotenv()
+
+_log = logging.getLogger("config")
 
 
 class Config:
@@ -42,10 +45,69 @@ class Config:
 
     @classmethod
     def validate(cls):
+        """Ishga tushishdan oldin barcha kritik sozlamalarni tekshiradi.
+
+        XAVFSIZLIK QOIDASI: kirish nazorati konfiguratsiyasi aniqlanmagan
+        holatda ISHGA TUSHMASLIGI kerak. ADMIN_IDS bo'sh bo'lsa avval bot
+        "hamma ruxsatli" rejimida ochiq qolardi — bu production uchun xavfli
+        standart holat, shuning uchun endi majburiy: yo'q bo'lsa startup
+        to'xtaydi, jim tarzda ochiq bot bo'lib qolmaydi."""
+        errors = []
+
         if not cls.BOT_TOKEN:
-            raise ValueError(
-                "BOT_TOKEN topilmadi!\n"
-                ".env faylga BOT_TOKEN=... qo'shing."
+            errors.append(
+                "BOT_TOKEN topilmadi — .env yoki Railway Variables'ga "
+                "BOT_TOKEN=<BotFather tokeni> qo'shing."
             )
-        if len(cls.BOT_TOKEN) < 40:
-            raise ValueError("BOT_TOKEN noto'g'ri ko'rinadi.")
+        elif len(cls.BOT_TOKEN) < 40:
+            errors.append("BOT_TOKEN noto'g'ri ko'rinadi (juda qisqa).")
+
+        if not cls.ADMIN_IDS:
+            errors.append(
+                "ADMIN_IDS topilmadi — bu MAJBURIY. Kamida bitta admin "
+                "Telegram ID siz bot kirish nazoratini aniqlay olmaydi va "
+                "xavfsiz ishga tushmaydi. .env yoki Railway Variables'ga "
+                "ADMIN_IDS=<sizning_telegram_id> qo'shing."
+            )
+
+        # CHECK_INTERVAL klass atributida allaqachon min 10s ga cheklangan;
+        # bu tekshiruv kelajakda o'sha cheklov olib tashlansa ham himoya beradi.
+        if cls.CHECK_INTERVAL < 10:
+            errors.append(
+                f"CHECK_INTERVAL juda kichik ({cls.CHECK_INTERVAL}s) — "
+                "kamida 10 soniya bo'lishi kerak (railway.uz'ga bosim tushirmaslik uchun)."
+            )
+
+        if not (1 <= cls.MAX_MONITORS_PER_USER <= 50):
+            errors.append(
+                f"MAX_MONITORS_PER_USER noto'g'ri ({cls.MAX_MONITORS_PER_USER}) — "
+                "1 dan 50 gacha bo'lishi kerak."
+            )
+
+        data_dir = cls.DATA_DIR or "."
+        try:
+            os.makedirs(data_dir, exist_ok=True)
+            probe = os.path.join(data_dir, ".write_test")
+            with open(probe, "w", encoding="utf-8") as f:
+                f.write("ok")
+            os.remove(probe)
+        except Exception as e:
+            errors.append(
+                f"DATA_DIR ('{data_dir}') yozib bo'lmadi: {e}. "
+                "Railway'da Volume ulanganini va mount path to'g'ri "
+                "ekanini tekshiring."
+            )
+
+        if errors:
+            raise ValueError(
+                "❌ Konfiguratsiya xatolari — bot ishga tushmaydi:\n- "
+                + "\n- ".join(errors)
+            )
+
+        if not os.getenv("TZ"):
+            _log.warning(
+                "⚠️ TZ o'zgaruvchisi sozlanmagan — server UTC vaqtida ishlaydi, "
+                "kalendar va 'sana/vaqt o'tdi' tekshiruvlari O'zbekiston vaqtidan "
+                "(UTC+5) farq qiladi. Railway Variables'ga TZ=Asia/Tashkent qo'shish "
+                "tavsiya etiladi."
+            )

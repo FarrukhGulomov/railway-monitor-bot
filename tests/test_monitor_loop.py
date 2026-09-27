@@ -193,3 +193,56 @@ class TestMonitorExpiry:
         assert sleep_called["n"] == 1
         texts = [c.args[1] for c in app.bot.send_message.await_args_list]
         assert not any("o'tib ketdi" in t for t in texts)
+
+
+class TestMonitorReflectsLiveEdits:
+    """Monitoring & Scheduler Reliability audit: foydalanuvchi /list orqali
+    ishlab turgan kuzatuvni tahrirlasa (masalan max_price'ni oshirsa),
+    o'sha kuzatuv keyingi tekshiruvda ESKI emas, YANGI filtr bilan
+    ishlashi kerak — monitor qayta ishga tushirilishini talab qilmasdan."""
+
+    def test_updated_max_price_applied_on_next_check_without_restart(
+        self, bot_module, fresh_db, monkeypatch
+    ):
+        # Boshlang'ich narx chegarasi (50_000) — poyezd (100_000) mos kelmaydi.
+        mon = dict(MON, max_price=50_000)
+        mid = fresh_db.save_monitor(100, mon)
+        expensive_train = _train("E1", 100_000)
+
+        checks = {"n": 0}
+
+        async def fake_search(client, *a, **kw):
+            checks["n"] += 1
+            if checks["n"] == 1:
+                # Birinchi tekshiruvdan KEYIN, ikkinchisidan OLDIN foydalanuvchi
+                # narx chegarasini oshiradi — xuddi /list orqali tahrirlagandek.
+                fresh_db.update_monitor_field(100, mid, "max_price", 150_000)
+            return bot_module.SearchResult(True, [expensive_train], "")
+
+        async def fake_get_client():
+            return object()
+
+        stop_after_second = {"n": 0}
+
+        async def fake_sleep(_):
+            stop_after_second["n"] += 1
+            if stop_after_second["n"] >= 2:
+                fresh_db.deactivate(mid)
+
+        monkeypatch.setattr(bot_module, "_shared_search", fake_search)
+        monkeypatch.setattr(bot_module, "_get_railway_client", fake_get_client)
+        monkeypatch.setattr(bot_module.asyncio, "sleep", fake_sleep)
+
+        app = MagicMock()
+        app.bot.send_message = AsyncMock()
+
+        asyncio.run(bot_module._monitor_loop(100, mid, dict(mon, id=mid), app))
+
+        texts = [c.args[1] for c in app.bot.send_message.await_args_list]
+        # 1-tekshiruv: 100_000 so'mlik poyezd hali eski (50_000) chegaradan
+        # tashqarida — "hozircha mos bilet yo'q" deb boshlang'ich xabar.
+        assert any("mos bilet yo'q" in t for t in texts)
+        # 2-tekshiruv: max_price DBda 150_000 ga yangilangan — endi mos keladi
+        # va "Yangi joy topildi" deb yuboriladi (restart shart emas edi).
+        assert any("Yangi joy topildi" in t for t in texts)
+        assert any("E1" in t for t in texts)

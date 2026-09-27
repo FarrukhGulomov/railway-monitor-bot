@@ -71,7 +71,9 @@ class RailwayClient:
 
             self._session.headers["X-Xsrf-Token"] = token
             self._session.cookies.set("XSRF-TOKEN", token, domain="eticket.railway.uz")
-            logger.info(f"✅ XSRF token o'rnatildi: {token[:15]}...")
+            # MUHIM: tokenning o'zini (hatto qisman ham) hech qachon log qilmaymiz —
+            # bu himoya tokeni, log fayli/bot.log orqali oshkor bo'lmasligi kerak.
+            logger.info("✅ XSRF token o'rnatildi")
 
         except Exception as e:
             logger.error(f"Session init xato: {e}")
@@ -132,7 +134,7 @@ class RailwayClient:
         for attempt in range(1, self.MAX_RETRIES + 1):
             try:
                 r = self._session.post(SEARCH_URL, json=payload, timeout=self.TIMEOUT)
-                logger.info(f"Search javobi: {r.status_code}")
+                logger.info(f"Search javobi (urinish {attempt}/{self.MAX_RETRIES}): {r.status_code}")
 
                 if r.status_code == 401:
                     logger.info("401 — session yangilanmoqda")
@@ -184,11 +186,35 @@ class RailwayClient:
                     last_error = "429 rate limited"
                     continue
 
+                if 500 <= r.status_code < 600:
+                    # Serverning o'tkinchi (transient) xatosi — saytga qarshi
+                    # bosim o'tkazmasdan, kichik backoff bilan qayta urinamiz.
+                    logger.warning(
+                        f"{r.status_code} server xatosi (urinish {attempt}/{self.MAX_RETRIES}): "
+                        f"{r.text[:200]}"
+                    )
+                    last_error = f"http_{r.status_code}"
+                    if attempt < self.MAX_RETRIES:
+                        time.sleep(2 * attempt)
+                        continue
+                    return SearchResult(False, [], last_error)
+
                 if r.status_code != 200:
                     logger.error(f"Status {r.status_code}: {r.text[:200]}")
                     return SearchResult(False, [], f"http_{r.status_code}")
 
-                data = r.json()
+                try:
+                    data = r.json()
+                except ValueError as e:
+                    # Sayt 200 qaytardi, lekin javob JSON emas/buzilgan —
+                    # bu ham "bilet yo'q" emas, alohida xato sifatida qaytariladi.
+                    logger.error(f"Buzilgan JSON javob (status 200): {e}")
+                    last_error = "malformed_json"
+                    if attempt < self.MAX_RETRIES:
+                        time.sleep(2)
+                        continue
+                    return SearchResult(False, [], last_error)
+
                 trains = (
                     data.get("data", {})
                     .get("directions", {})

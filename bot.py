@@ -10,6 +10,7 @@ import time
 import fcntl
 import calendar
 from datetime import datetime, timedelta
+from logging.handlers import RotatingFileHandler
 from typing import Optional
 
 from telegram import (
@@ -28,12 +29,17 @@ from database import Database
 from security import SecurityMiddleware
 
 # ─── Logging ────────────────────────────────────────────────────────────────────
+# Railway'ning o'z log ko'ruvchisi stdout'ni o'qiydi — bu doim ishlaydi.
+# Fayl logi (bot.log, /logs buyrug'i uchun) endi RotatingFileHandler bilan —
+# cheksiz o'sib, konteyner diskini to'ldirib yubormasligi uchun (10MB x 5 fayl).
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     level=logging.INFO,
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler("bot.log", encoding="utf-8"),
+        RotatingFileHandler(
+            "bot.log", maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8"
+        ),
     ],
 )
 logger = logging.getLogger("railway_bot")
@@ -95,7 +101,6 @@ TIME_RANGES = {
     "custom":  (None, None,       "✏️ O'zim kiritaman"),
 }
 
-ADMIN_ID = 370898987  # eski standart admin — ADMIN_IDS sozlanmagan bo'lsa fallback
 LOCK_FILE = "/tmp/railway_bot.lock"
 
 db = Database(path=os.path.join(Config.DATA_DIR, "data.json"))
@@ -178,28 +183,72 @@ async def _shutdown_monitors(app):
 
 
 def is_admin(uid: int) -> bool:
-    """Foydalanuvchi admin (Railway ADMIN_IDS o'zgaruvchisidan) mi?"""
-    if Config.ADMIN_IDS:
-        return uid in Config.ADMIN_IDS
-    return uid == ADMIN_ID
+    """Foydalanuvchi admin (Railway ADMIN_IDS o'zgaruvchisidan) mi?
+    ADMIN_IDS bo'sh bo'lsa (Config.validate() buni ishga tushishda taqiqlaydi,
+    lekin himoya sifatida) — hech kim admin emas, FAIL-CLOSED."""
+    return uid in Config.ADMIN_IDS
 
 
 def has_access(uid: int) -> bool:
-    """Foydalanuvchi botdan foydalanishga ruxsatlimi?"""
+    """Foydalanuvchi botdan foydalanishga ruxsatlimi?
+
+    XAVFSIZLIK QOIDASI (fail-closed): kirish konfiguratsiyasi aniqlanmagan
+    yoki bo'sh bo'lgani uchun HECH QACHON `True` qaytarilmaydi. Ruxsat faqat
+    quyidagi aniq manbalardan birida bo'lishi kerak:
+    - admin (ADMIN_IDS);
+    - admin tomonidan /addUser(s) orqali qo'shilgan (DB, active);
+    - ALLOWED_USERS statik ro'yxatida (ixtiyoriy qo'shimcha whitelisting).
+    Boshqa har qanday holatda — ruxsat yo'q."""
     if is_admin(uid):
         return True
     if db.is_added_user(uid):
         return True
     if Config.ALLOWED_USERS:
         return uid in Config.ALLOWED_USERS
-    if Config.ADMIN_IDS:
-        # Admin tizimi yoqilgan — endi faqat admin va u qo'shgan userlar ruxsatli
-        return False
-    return True  # Hech narsa sozlanmagan — ochiq bot (eski xatti-harakat)
+    return False
 
 
 def _admin_ids() -> list[int]:
-    return Config.ADMIN_IDS if Config.ADMIN_IDS else [ADMIN_ID]
+    return Config.ADMIN_IDS
+
+
+# ─── Dekoratorlar ───────────────────────────────────────────────────────────────
+def restricted(func):
+    """Har bir handler — matn buyrug'i BO'LSIN, inline tugma bosilishi
+    BO'LSIN — shu orqali o'tishi kerak. Bu callback handlerlar (/list va
+    /users boshqaruv tugmalari, kontakt ulashish) uchun ham amal qiladi:
+    aks holda botdan o'chirilgan foydalanuvchi eski xabaridagi tugmalar
+    orqali hali ham o'z kuzatuvlarini boshqarishda davom eta olardi —
+    ruxsat bekor qilingandan keyin ham amal qiladigan "orphan" boshqaruv
+    yo'li qolmasligi kerak."""
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        uid = update.effective_user.id
+        if not has_access(uid):
+            logger.warning(f"Ruxsatsiz: uid={uid}")
+            if update.callback_query:
+                try:
+                    await update.callback_query.answer("⛔ Sizga ruxsat yo'q.", show_alert=True)
+                except Exception:
+                    pass
+            else:
+                await update.effective_message.reply_text("⛔ Sizga ruxsat yo'q.")
+            return ConversationHandler.END
+        if not db.touch_user_activity(uid):
+            logger.warning(f"Faollik statistikasi saqlanmadi (DB write xato): uid={uid}")
+        return await func(update, context, *args, **kwargs)
+    wrapper.__name__ = func.__name__
+    return wrapper
+
+
+def rate_limited(func):
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        uid = update.effective_user.id
+        if security.is_rate_limited(uid):
+            await update.effective_message.reply_text("⏳ Juda tez bosyapsiz.")
+            return
+        return await func(update, context, *args, **kwargs)
+    wrapper.__name__ = func.__name__
+    return wrapper
 
 
 def _user_card(user) -> str:
@@ -240,6 +289,7 @@ async def _notify_admins_start(update: Update, context: ContextTypes.DEFAULT_TYP
             logger.warning(f"Admin {aid} ga /start xabari yuborilmadi: {e}")
 
 
+@restricted
 async def got_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Foydalanuvchi telefon raqamini ulashganda adminlarga yuborish va saqlash"""
     contact = update.message.contact
@@ -249,7 +299,12 @@ async def got_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if contact.user_id != user.id:
         await update.message.reply_text("❌ Iltimos, tugma orqali o'z raqamingizni ulashing.")
         return
-    db.set_user_phone(user.id, contact.phone_number)
+    phone_saved = db.set_user_phone(user.id, contact.phone_number)
+    if phone_saved is None:
+        await update.message.reply_text(
+            "⚠️ Vaqtinchalik xatolik — raqamni saqlab bo'lmadi. Birozdan so'ng qaytadan urinib ko'ring."
+        )
+        return
     text = (
         "📱 *Telefon raqami ulashildi:*\n\n"
         f"{_user_card(user)}\n"
@@ -277,31 +332,6 @@ def acquire_lock():
     except IOError:
         logger.error("Bot allaqachon ishlamoqda! Avvalgi processni to'xtatib qayta ishga tushiring.")
         sys.exit(1)
-
-
-# ─── Dekoratorlar ───────────────────────────────────────────────────────────────
-def restricted(func):
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
-        uid = update.effective_user.id
-        if not has_access(uid):
-            logger.warning(f"Ruxsatsiz: uid={uid}")
-            await update.effective_message.reply_text("⛔ Sizga ruxsat yo'q.")
-            return ConversationHandler.END
-        db.touch_user_activity(uid)
-        return await func(update, context, *args, **kwargs)
-    wrapper.__name__ = func.__name__
-    return wrapper
-
-
-def rate_limited(func):
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
-        uid = update.effective_user.id
-        if security.is_rate_limited(uid):
-            await update.effective_message.reply_text("⏳ Juda tez bosyapsiz.")
-            return
-        return await func(update, context, *args, **kwargs)
-    wrapper.__name__ = func.__name__
-    return wrapper
 
 
 # ─── Kalendar ───────────────────────────────────────────────────────────────────
@@ -370,7 +400,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.warning(f"Ruxsatsiz: uid={uid}")
         await update.message.reply_text("⛔ Sizga ruxsat yo'q.")
         return
-    db.touch_user_activity(uid)
+    if not db.touch_user_activity(uid):
+        logger.warning(f"Faollik statistikasi saqlanmadi (DB write xato): uid={uid}")
 
     extra = (
         "\n\n👑 *Admin buyruqlari:*\n"
@@ -386,7 +417,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/monitor — Yangi kuzatuv\n"
         "/list — Faol kuzatuvlar (tahrirlash/o'chirish)\n"
         "/stop — Barchasini to'xtatish\n"
-        "/help — Yordam" + extra,
+        "/help — Yordam\n"
+        "/privacy — Maxfiylik siyosati" + extra,
         parse_mode="Markdown",
     )
 
@@ -419,7 +451,32 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "3️⃣ Har minutda kuzatib, yangi chiqqanda xabar beradi\n"
         "4️⃣ /list — kuzatuvlarni ko'rish, tahrirlash, o'chirish\n\n"
         "*Interval:* 60 soniyada bir tekshirish\n"
-        "*Limit:* Bir vaqtda 5 ta kuzatuv" + extra,
+        "*Limit:* Bir vaqtda 5 ta kuzatuv\n\n"
+        "🔒 /privacy — qanday ma'lumotlaringiz saqlanishi haqida" + extra,
+        parse_mode="Markdown",
+    )
+
+
+# ─── /privacy ───────────────────────────────────────────────────────────────────
+async def cmd_privacy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Har kimga ochiq — hatto botdan hali ruxsat olmagan foydalanuvchiga ham
+    qanday ma'lumot saqlanishi haqida shaffof javob berish kerak."""
+    await update.message.reply_text(
+        "🔒 *Maxfiylik va ma'lumotlar*\n\n"
+        "Ushbu bot quyidagilarni saqlaydi (faqat botdan foydalanish uchun):\n"
+        "• Telegram ID, ism, username, til — kirish nazorati va admin panel uchun;\n"
+        "• Telefon raqami — FAQAT o'zingiz \"Telefon raqamni ulashish\" tugmasini "
+        "bosib, ixtiyoriy ravishda yuborsangiz;\n"
+        "• Siz yaratgan kuzatuvlar (marshrut, sana, filtrlar) va ularning tarixi;\n"
+        "• So'nggi faollik vaqti va amallar soni — admin uchun statistika.\n\n"
+        "Ma'lumotlar botni ishlatgan xizmat ko'rsatuvchisi (server) diskida "
+        "saqlanadi va uchinchi shaxslarga uzatilmaydi. Admin sizni botdan "
+        "o'chirsa, bundan buyon botdan foydalana olmaysiz; mavjud yozuvlar "
+        "kelajakda qayta faollashtirish/audit uchun arxivda qolishi mumkin — "
+        "agar ma'lumotlaringizni butunlay o'chirishni so'ramoqchi bo'lsangiz, "
+        "adminga to'g'ridan-to'g'ri murojaat qiling.\n\n"
+        "Telefon raqami ulashish har doim ixtiyoriy — rad etsangiz ham "
+        "botning barcha funksiyalaridan foydalanishda davom etasiz.",
         parse_mode="Markdown",
     )
 
@@ -466,10 +523,17 @@ async def cmd_add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     tid = int(args[0])
     name = " ".join(args[1:]) if len(args) > 1 else ""
-    is_new = db.add_user(tid, added_by=uid, first_name=name)
-    verb = "qo'shildi" if is_new else "allaqachon ro'yxatda edi (qayta faollashtirildi)"
+    result = db.add_user(tid, added_by=uid, first_name=name)
+    if result is None:
+        await update.message.reply_text(
+            "❌ Foydalanuvchini saqlab bo'lmadi — serverda vaqtinchalik xatolik.\n"
+            "Iltimos, birozdan so'ng qaytadan urinib ko'ring."
+        )
+        return
+    verb = "qo'shildi" if result else "allaqachon ro'yxatda edi (qayta faollashtirildi)"
+    name_suffix = f" — {escape_markdown(name)}" if name else ""
     await update.message.reply_text(
-        f"✅ Foydalanuvchi `{tid}` {verb}" + (f" — {name}" if name else ""),
+        f"✅ Foydalanuvchi `{tid}` {verb}{name_suffix}",
         parse_mode="Markdown",
     )
     try:
@@ -501,19 +565,61 @@ async def cmd_add_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not ids:
         await update.message.reply_text("❌ To'g'ri telegram ID topilmadi.")
         return
-    added = sum(1 for tid in ids if db.add_user(tid, added_by=uid))
-    reactivated = len(ids) - added
-    await update.message.reply_text(
-        f"✅ {added} ta yangi qo'shildi, {reactivated} ta qayta faollashtirildi.\n"
-        f"Jami: {len(ids)} ta ID."
-    )
+
+    added, reactivated, failed = 0, 0, 0
+    succeeded_ids = []
     for tid in ids:
+        result = db.add_user(tid, added_by=uid)
+        if result is True:
+            added += 1
+            succeeded_ids.append(tid)
+        elif result is False:
+            reactivated += 1
+            succeeded_ids.append(tid)
+        else:  # None — yozuv muvaffaqiyatsiz
+            failed += 1
+
+    msg = f"✅ {added} ta yangi qo'shildi, {reactivated} ta qayta faollashtirildi."
+    if failed:
+        msg += f"\n⚠️ {failed} ta ID saqlanmadi (vaqtinchalik xatolik) — qaytadan urinib ko'ring."
+    await update.message.reply_text(msg)
+
+    # Faqat DISKKA HAQIQATAN saqlangan foydalanuvchilarga xabar yuboramiz —
+    # yozuvi muvaffaqiyatsiz bo'lganlarga soxta "ruxsat berildi" demaymiz.
+    for tid in succeeded_ids:
         try:
             await context.application.bot.send_message(
                 tid, "✅ Sizga botdan foydalanish huquqi berildi!\n/start bosing."
             )
         except Exception:
             pass
+
+
+async def _admin_remove_user(tid: int, context: ContextTypes.DEFAULT_TYPE) -> str:
+    """Foydalanuvchini botdan o'chirish umumiy oqimi (/removeUser va /users
+    panelidagi tugma bir xil mantiqni ishlatadi). Ruxsatni bekor qilish
+    DISKKA muvaffaqiyatli yozilmaguncha "o'chirildi" deb HECH QACHON
+    aytilmaydi — chaqiruvchiga ko'rsatiladigan matnni qaytaradi."""
+    result = db.remove_user(tid)
+    if result is None:
+        return "⚠️ Vaqtinchalik xatolik — foydalanuvchini o'chirib bo'lmadi. Qaytadan urinib ko'ring."
+    if result is False:
+        return "❌ Topilmadi yoki allaqachon o'chirilgan."
+
+    # Ruxsat muvaffaqiyatli bekor qilindi (eng muhim xavfsizlik amali bajarildi).
+    # Uning faol kuzatuvlarini to'xtatish — ikkinchi darajali tozalash;
+    # muvaffaqiyatsiz bo'lsa ham ruxsat bekor qilingani rost qoladi, faqat log qilinadi.
+    monitors_result = db.deactivate_all(tid)
+    if monitors_result is None:
+        logger.error(f"Foydalanuvchi {tid} o'chirildi, lekin uning kuzatuvlarini to'xtatib bo'lmadi")
+
+    try:
+        await context.application.bot.send_message(
+            tid, "⛔ Sizning botdan foydalanish huquqingiz bekor qilindi."
+        )
+    except Exception:
+        pass
+    return f"✅ Foydalanuvchi `{tid}` botdan o'chirildi."
 
 
 async def cmd_remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -528,15 +634,8 @@ async def cmd_remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     tid = int(args[0])
-    if db.remove_user(tid):
-        db.deactivate_all(tid)
-        await update.message.reply_text(f"✅ Foydalanuvchi `{tid}` botdan o'chirildi.", parse_mode="Markdown")
-        try:
-            await context.application.bot.send_message(tid, "⛔ Sizning botdan foydalanish huquqingiz bekor qilindi.")
-        except Exception:
-            pass
-    else:
-        await update.message.reply_text("❌ Topilmadi yoki allaqachon o'chirilgan.")
+    text = await _admin_remove_user(tid, context)
+    await update.message.reply_text(text, parse_mode="Markdown")
 
 
 def _users_keyboard(users: list) -> InlineKeyboardMarkup:
@@ -632,15 +731,8 @@ async def usr_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     _, tid_str = q.data.split("|", 1)
     tid = int(tid_str)
-    if db.remove_user(tid):
-        db.deactivate_all(tid)
-        await q.edit_message_text(f"✅ Foydalanuvchi `{tid}` botdan o'chirildi.", parse_mode="Markdown")
-        try:
-            await context.application.bot.send_message(tid, "⛔ Sizning botdan foydalanish huquqingiz bekor qilindi.")
-        except Exception:
-            pass
-    else:
-        await q.edit_message_text("❌ Topilmadi yoki allaqachon o'chirilgan.")
+    text = await _admin_remove_user(tid, context)
+    await q.edit_message_text(text, parse_mode="Markdown")
 
 
 async def usr_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -925,6 +1017,7 @@ def _monitors_keyboard(monitors: list) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+@restricted
 async def mgr_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -948,17 +1041,22 @@ async def mgr_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+@restricted
 async def mgr_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     _, mid = q.data.split("|", 1)
     uid = q.from_user.id
-    if db.deactivate_for_user(uid, mid):
+    result = db.deactivate_for_user(uid, mid)
+    if result is True:
         await q.edit_message_text(f"✅ Kuzatuv `{mid}` o'chirildi.", parse_mode="Markdown")
+    elif result is None:
+        await q.edit_message_text("⚠️ Vaqtinchalik xatolik — o'chirib bo'lmadi. Qaytadan urinib ko'ring.")
     else:
         await q.edit_message_text("❌ Topilmadi.")
 
 
+@restricted
 async def mgr_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -978,6 +1076,7 @@ async def mgr_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+@restricted
 async def mgr_edit_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -1025,6 +1124,7 @@ async def mgr_edit_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+@restricted
 async def mgr_time_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -1032,22 +1132,33 @@ async def mgr_time_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t_from, t_to, label = TIME_RANGES[trange]
     mid = context.user_data.get("edit_mid")
     uid = q.from_user.id
-    db.update_monitor_field(uid, mid, "time_from", t_from)
-    db.update_monitor_field(uid, mid, "time_to", t_to)
-    db.update_monitor_field(uid, mid, "time_label", label)
-    await q.edit_message_text(f"✅ Vaqt oralig'i yangilandi: {label}\n\n/list — ro'yxatga qaytish")
+    # Uchala maydon (time_from/time_to/time_label) BITTA tranzaksiyada
+    # yoziladi — aks holda yozuv o'rtada muvaffaqiyatsiz bo'lib qolsa,
+    # monitor nomuvofiq holatda (masalan yangi time_from, eski time_label)
+    # qolib ketishi mumkin edi.
+    ok = db.update_monitor_fields(uid, mid, {
+        "time_from": t_from, "time_to": t_to, "time_label": label,
+    })
+    if ok:
+        await q.edit_message_text(f"✅ Vaqt oralig'i yangilandi: {label}\n\n/list — ro'yxatga qaytish")
+    else:
+        await q.edit_message_text("⚠️ Vaqtinchalik xatolik — saqlab bo'lmadi. Qaytadan urinib ko'ring.")
 
 
+@restricted
 async def mgr_car_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     _, car = q.data.split("|", 1)
     mid = context.user_data.get("edit_mid")
     uid = q.from_user.id
-    db.update_monitor_field(uid, mid, "car_type", car)
-    await q.edit_message_text(f"✅ Vagon turi yangilandi: {CAR_TYPES[car]}\n\n/list — ro'yxatga qaytish")
+    if db.update_monitor_field(uid, mid, "car_type", car):
+        await q.edit_message_text(f"✅ Vagon turi yangilandi: {CAR_TYPES[car]}\n\n/list — ro'yxatga qaytish")
+    else:
+        await q.edit_message_text("⚠️ Vaqtinchalik xatolik — saqlab bo'lmadi. Qaytadan urinib ko'ring.")
 
 
+@restricted
 async def mgr_cal_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Tahrirlash rejimida sana tanlash"""
     q = update.callback_query
@@ -1057,13 +1168,16 @@ async def mgr_cal_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     field = context.user_data.get("edit_field")
     if field == "date" and mid:
         uid = q.from_user.id
-        db.update_monitor_field(uid, mid, "date", date_str)
-        await q.edit_message_text(f"✅ Sana yangilandi: {date_str}\n\n/list — ro'yxatga qaytish")
+        if db.update_monitor_field(uid, mid, "date", date_str):
+            await q.edit_message_text(f"✅ Sana yangilandi: {date_str}\n\n/list — ro'yxatga qaytish")
+        else:
+            await q.edit_message_text("⚠️ Vaqtinchalik xatolik — saqlab bo'lmadi. Qaytadan urinib ko'ring.")
     else:
         # Oddiy /monitor flow
         await cal_pick(update, context)
 
 
+@restricted
 async def mgr_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -1080,6 +1194,7 @@ async def mgr_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+@restricted
 async def mgr_edit_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Narx yoki joy soni tahrirlash uchun matn kiritish"""
     field = context.user_data.get("edit_field")
@@ -1094,7 +1209,9 @@ async def mgr_edit_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not cleaned.isdigit():
             await update.message.reply_text("❌ Faqat raqam yoki /skip")
             return
-        db.update_monitor_field(uid, mid, "max_price", int(cleaned))
+        if not db.update_monitor_field(uid, mid, "max_price", int(cleaned)):
+            await update.message.reply_text("⚠️ Vaqtinchalik xatolik — saqlab bo'lmadi. Qaytadan urinib ko'ring.")
+            return
         await update.message.reply_text(f"✅ Narx yangilandi: {int(cleaned):,} so'm\n\n/list — ro'yxatga qaytish")
     else:  # seats
         if not text.isdigit() or int(text) < 1:
@@ -1104,13 +1221,16 @@ async def mgr_edit_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if n > MAX_SEATS_LIMIT:
             await update.message.reply_text(f"❌ Ko'pi bilan {MAX_SEATS_LIMIT} ta.")
             return
-        db.update_monitor_field(uid, mid, "min_seats", n)
+        if not db.update_monitor_field(uid, mid, "min_seats", n):
+            await update.message.reply_text("⚠️ Vaqtinchalik xatolik — saqlab bo'lmadi. Qaytadan urinib ko'ring.")
+            return
         await update.message.reply_text(f"✅ Joy soni yangilandi: {n} ta\n\n/list — ro'yxatga qaytish")
 
     context.user_data.pop("edit_field", None)
     context.user_data.pop("edit_mid", None)
 
 
+@restricted
 async def mgr_edit_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Narx/joy soni tahrirlashda /skip — standart qiymatga qaytarish.
     (Buyruqlar filters.TEXT ga tushmaydi, shuning uchun alohida handler kerak)"""
@@ -1120,11 +1240,14 @@ async def mgr_edit_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mid = context.user_data.get("edit_mid")
     uid = update.effective_user.id
     if field == "price":
-        db.update_monitor_field(uid, mid, "max_price", None)
-        msg = "✅ Narx cheki olib tashlandi."
+        ok = db.update_monitor_field(uid, mid, "max_price", None)
+        msg = "✅ Narx cheki olib tashlandi." if ok else None
     else:
-        db.update_monitor_field(uid, mid, "min_seats", 1)
-        msg = "✅ Joy soni: 1 ta (standart)."
+        ok = db.update_monitor_field(uid, mid, "min_seats", 1)
+        msg = "✅ Joy soni: 1 ta (standart)." if ok else None
+    if not ok:
+        await update.message.reply_text("⚠️ Vaqtinchalik xatolik — saqlab bo'lmadi. Qaytadan urinib ko'ring.")
+        return
     context.user_data.pop("edit_field", None)
     context.user_data.pop("edit_mid", None)
     await update.message.reply_text(f"{msg}\n\n/list — ro'yxatga qaytish")
@@ -1137,13 +1260,21 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if args:
         mid = args[0].strip()
-        if db.deactivate_for_user(uid, mid):
+        result = db.deactivate_for_user(uid, mid)
+        if result is True:
             await update.message.reply_text(f"⏹ `{mid}` to'xtatildi.", parse_mode="Markdown")
+        elif result is None:
+            await update.message.reply_text("⚠️ Vaqtinchalik xatolik — to'xtatib bo'lmadi. Qaytadan urinib ko'ring.")
         else:
             await update.message.reply_text("❌ Topilmadi.")
     else:
         count = db.deactivate_all(uid)
-        await update.message.reply_text(f"⏹ {count} ta kuzatuv to'xtatildi." if count else "📭 Faol kuzatuv yo'q.")
+        if count is None:
+            await update.message.reply_text("⚠️ Vaqtinchalik xatolik — to'xtatib bo'lmadi. Qaytadan urinib ko'ring.")
+        elif count:
+            await update.message.reply_text(f"⏹ {count} ta kuzatuv to'xtatildi.")
+        else:
+            await update.message.reply_text("📭 Faol kuzatuv yo'q.")
 
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1207,7 +1338,15 @@ async def _monitor_loop(uid: int, mid: str, data: dict, app):
                         f"🆔 `{mid}`",
                         parse_mode="Markdown",
                     )
-                    db.deactivate(mid)
+                    if not db.deactivate(mid):
+                        # DBda hali "faol" deb qolgan bo'lishi mumkin — asyncio task
+                        # baribir tugaydi (foydalanuvchi allaqachon xabar oldi va vaqt
+                        # o'tgan, qayta qidirishning ma'nosi yo'q). Operator qo'lda
+                        # tekshira olishi uchun CRITICAL darajada log qilamiz.
+                        logger.critical(
+                            f"mid={mid}: vaqt tugagani sababli deactivate yozib "
+                            "bo'lmadi — DB hali 'faol' deb ko'rsatishi mumkin"
+                        )
                     logger.info(f"Vaqt o'tib ketgani uchun to'xtatildi: mid={mid}")
                     return
             except ValueError:
@@ -1322,7 +1461,11 @@ async def _monitor_loop(uid: int, mid: str, data: dict, app):
                         )
                         seen_fingerprints |= fingerprints
                         if not first_run:
-                            db.deactivate(mid)
+                            if not db.deactivate(mid):
+                                logger.critical(
+                                    f"mid={mid}: joy topilgani uchun deactivate yozib "
+                                    "bo'lmadi — DB hali 'faol' deb ko'rsatishi mumkin"
+                                )
                             logger.info(f"Yangi joy topildi, monitor to'xtatildi: mid={mid}")
                             return
                     else:
@@ -1487,6 +1630,7 @@ def main():
 
     app.add_handler(CommandHandler("start",  cmd_start))
     app.add_handler(CommandHandler("help",   cmd_help))
+    app.add_handler(CommandHandler("privacy", cmd_privacy))
     app.add_handler(CommandHandler("stop",   cmd_stop))
     app.add_handler(CommandHandler("logs",   cmd_logs))
     app.add_handler(CommandHandler("list",   cmd_list))

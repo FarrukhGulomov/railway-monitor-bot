@@ -5,13 +5,16 @@ from railway_client import RailwayClient
 
 
 class _FakeResponse:
-    def __init__(self, status_code, text="", json_data=None, headers=None):
+    def __init__(self, status_code, text="", json_data=None, headers=None, json_error=False):
         self.status_code = status_code
         self.text = text
         self._json = json_data or {}
         self.headers = headers or {}
+        self._json_error = json_error
 
     def json(self):
+        if self._json_error:
+            raise ValueError("buzilgan JSON")
         return self._json
 
 
@@ -68,10 +71,33 @@ class TestSearchResultStatus:
         result = client.search_trains("A", "B", "2030-01-01")
         assert result.ok is False
 
-    def test_500_is_error(self, monkeypatch):
-        client = _make_client(monkeypatch, [_FakeResponse(500, text="server error")])
+    def test_500_exhausts_retries_is_error(self, monkeypatch):
+        # 5xx endi transient deb qayta uriniladi (MAX_RETRIES=3) — uchalasi
+        # ham 500 bo'lsa, retrylar tugagach xato qaytariladi.
+        responses = [_FakeResponse(500, text="server error")] * 3
+        client = _make_client(monkeypatch, responses)
         result = client.search_trains("A", "B", "2030-01-01")
         assert result.ok is False
+        assert client._session.calls == 3
+
+    def test_5xx_retries_then_recovers(self, monkeypatch):
+        # Birinchi urinish 503 (transient), ikkinchisi muvaffaqiyatli —
+        # railway.uz'ning vaqtinchalik xatosidan keyin tiklanishi kerak.
+        payload = {"data": {"directions": {"forward": {"trains": [{"number": "7"}]}}}}
+        responses = [_FakeResponse(503, text="bad gateway"), _FakeResponse(200, json_data=payload)]
+        client = _make_client(monkeypatch, responses)
+        result = client.search_trains("A", "B", "2030-01-01")
+        assert result.ok is True
+        assert result.trains == [{"number": "7"}]
+        assert client._session.calls == 2
+
+    def test_malformed_json_is_error_not_empty(self, monkeypatch):
+        # Status 200 lekin javob tanasi buzilgan JSON — bu ham "reys yo'q" emas.
+        responses = [_FakeResponse(200, json_error=True)] * 3
+        client = _make_client(monkeypatch, responses)
+        result = client.search_trains("A", "B", "2030-01-01")
+        assert result.ok is False
+        assert result.trains == []
 
     def test_400_express_temp_unavailable_is_error_not_empty(self, monkeypatch):
         # Sayt Express xizmati vaqtincha javob bermayapti — bu ham "reys yo'q" emas.

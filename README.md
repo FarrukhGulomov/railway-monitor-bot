@@ -10,9 +10,10 @@ O'zbekiston temir yo'llari (`eticket.railway.uz`) da poyezd joylarini kuzatib, j
 
 - ✅ Poyezd joylarini avtomatik kuzatish
 - ✅ Joy chiqqanda darhol Telegram xabar
-- ✅ Vagon turi va narx filtri
+- ✅ Vagon turi, narx va joy soni filtri
 - ✅ Bir vaqtda bir nechta marshrut kuzatuvi
-- ✅ Foydalanuvchi whitelisti (xavfsizlik)
+- ✅ Admin panel: foydalanuvchi qo'shish/o'chirish, faoliyatini kuzatish
+- ✅ Fail-closed kirish nazorati (admin ID siz bot ishga tushmaydi)
 - ✅ Rate limiting himoyasi
 
 ---
@@ -46,12 +47,16 @@ cp .env.example .env
 `.env` faylga quyidagilarni kiriting:
 ```env
 BOT_TOKEN=sizning_bot_tokeningiz
-ALLOWED_USERS=sizning_telegram_id_ingiz
 ADMIN_IDS=sizning_telegram_id_ingiz
 ```
 
 **Bot token** — [@BotFather](https://t.me/BotFather) dan oling  
 **Telegram ID** — [@userinfobot](https://t.me/userinfobot) ga yozing
+
+> ⚠️ **`ADMIN_IDS` MAJBURIY.** Agar u bo'sh bo'lsa, bot `Config.validate()`
+> bosqichida xato ko'tarib ishga tushishdan bosh tortadi — bu ataylab shunday:
+> kirish nazorati konfiguratsiyasi aniq bo'lmagan holatda bot "hamma
+> ruxsatli" ochiq rejimda jim qolib ketmasligi kerak.
 
 ### 5. Ishga tushirish
 ```bash
@@ -69,6 +74,7 @@ python bot.py
 | `/list` | Faol kuzatuvlar ro'yxati |
 | `/stop <id>` | Kuzatuvni to'xtatish |
 | `/help` | Yordam |
+| `/privacy` | Qanday ma'lumot saqlanishi haqida (hammaga ochiq) |
 
 ### Admin buyruqlari (`ADMIN_IDS` da ko'rsatilgan foydalanuvchilar uchun)
 
@@ -113,6 +119,61 @@ Volume ulamasangiz, qo'shilgan foydalanuvchilar va kuzatuvlar har deploy'da o'ch
 > ♻️ Volume ulangandan keyin: bot restart bo'lganda faol kuzatuvlar avtomatik davom etadi,
 > sanasi o'tib ketganlari esa ro'yxatdan avtomatik olib tashlanadi.
 
+### ⚠️ MUHIM: Faqat 1 ta replika (instance)
+
+Bot Telegram bilan **polling** orqali ishlaydi (webhook emas) va holatini
+**lokal JSON fayl** + `/tmp` fayl qulfi orqali boshqaradi. Bu ikkalasi ham
+**bitta process** haqida taxmin qiladi:
+
+- Ikkita instance bir xil Telegram tokendan polling qilsa, Telegram
+  ikkalasiga ham bir xil xabarlarni yuborishga urinadi — duplikat javoblar,
+  poyezd qidiruv so'rovlari ikki barobar ko'payadi.
+- `/tmp/railway_bot.lock` fayl qulfi **faqat bitta konteyner ICHIDA**
+  ikkinchi process ishga tushishining oldini oladi (masalan xato bilan
+  qayta ishga tushirilgan eski process). U **konteynerlar orasida**
+  himoya bermaydi — Railway'da 2 ta alohida replika ishga tushirilsa,
+  har biri o'zining `/tmp` fayl tizimiga ega bo'lgani uchun ikkalasi ham
+  qulfni muvaffaqiyatli oladi va PARALEL ishlaydi, bu esa yuqoridagi
+  muammolarga olib keladi.
+
+**Xulosa:** Railway'da service uchun replika sonini har doim **1** da
+qoldiring (standart holat — Railway avtomatik ko'paytirmaydi, lekin
+qo'lda oshirmang).
+
+---
+
+## Production Checklist
+
+Ishga tushirishdan oldin:
+
+- [ ] `BOT_TOKEN` — @BotFather'dan olingan, to'g'ri
+- [ ] `ADMIN_IDS` — kamida bitta admin Telegram ID (bo'sh bo'lsa bot ishga tushmaydi)
+- [ ] Railway'da **Volume** ulangan, mount path va `DATA_DIR` mos keladi
+- [ ] `TZ=Asia/Tashkent` qo'yilgan (bo'lmasa server UTC'da ishlaydi)
+- [ ] Service **1 ta replika**da ishlayapti (yuqoridagi ogohlantirishga qarang)
+- [ ] `pytest` mahalliy/CI'da yashil
+- [ ] `.env` fayl `.gitignore`'da va hech qachon commit qilinmagan
+- [ ] Railway loglarida (yoki `/logs`) `⚠️`/`❌` ogohlantirish yo'q
+
+Ushbu tekshiruvlar bajarilgan bo'lsa, bot kichik/o'rta yopiq foydalanuvchi
+guruhi (do'stlar, oila, yopiq jamoat) uchun production-ready hisoblanadi.
+
+### Ma'lum cheklovlar (kelajakda yaxshilash mumkin)
+
+- **Bitta process, JSON fayl DB** — kichik/o'rta yuklama uchun yetarli,
+  lekin ko'p yozuvli parallel yuklamada (yuzlab faol foydalanuvchi) fayl
+  qulflash sekinlashishi mumkin. Migratsiya yo'li: **JSON → SQLite →
+  PostgreSQL** — SQLite bitta fayl DB sifatida deyarli bir xil deploy
+  modelini saqlab, WAL rejimi bilan yozuv performansini oshiradi;
+  PostgreSQL esa ko'p replika/gorizontal masshtablashtirish kerak bo'lsa
+  tabiiy keyingi qadam (lekin bu holda polling o'rniga webhook + tashqi
+  scheduler arxitekturasi ham qayta ko'rib chiqilishi kerak bo'ladi).
+- **Global rate limiting yo'q** — har foydalanuvchi 60s oynada ~20 so'rov
+  bilan cheklangan (`security.py`), lekin butun bot darajasida umumiy
+  chegara yo'q. Kichik yopiq foydalanuvchi guruhi uchun bu yetarli deb
+  baholandi; agar foydalanuvchilar soni sezilarli o'ssa, qayta ko'rib
+  chiqilishi tavsiya etiladi.
+
 ---
 
 ## Testlar
@@ -130,6 +191,11 @@ Har bir push/PR da GitHub Actions CI testlarni avtomatik ishga tushiradi.
 
 - `.env` faylni **hech qachon** GitHub ga yuklamang
 - `data.json` va `bot.log` `.gitignore` da — xavfsiz
+- `bot.log` avtomatik aylanadi (`RotatingFileHandler`, 10MB × 5 fayl) —
+  konteyner diskini cheksiz to'ldirmaydi. Railway'ning o'z log ko'ruvchisi
+  stdout orqali ishlaydi va bundan mustaqil.
+- Foydalanuvchi ma'lumotlari qanday saqlanishi haqida — botda `/privacy`
+  buyrug'i orqali har kimga (admin bo'lmasa ham) tushuntiriladi.
 
 ---
 
