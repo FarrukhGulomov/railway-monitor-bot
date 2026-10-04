@@ -649,3 +649,58 @@ class TestExpiryUsesFreshState:
             "to'xtatildi — tahrirlangan (yangi, hali tugamagan) sana e'tiborsiz qoldirildi"
         )
         assert search_called["n"] >= 1  # qidiruv HAQIQATDA amalga oshdi, bekorga to'xtatilmadi
+
+
+class TestNotificationShowsDates:
+    """Ko'p kuzatuv bo'lganda natija qaysi sana uchunligi aniq ko'rinishi kerak."""
+
+    def _run_first_check(self, bot_module, fresh_db, monkeypatch, train, date="2026-10-31"):
+        mon = dict(MON, date=date)
+        mid = fresh_db.save_monitor(100, mon)
+
+        async def fake_search(client, *a, **kw):
+            return bot_module.SearchResult(True, [train], "")
+
+        async def fake_get_client():
+            return object()
+
+        async def fake_sleep(_):
+            fresh_db.deactivate(mid)
+
+        monkeypatch.setattr(bot_module, "_shared_search", fake_search)
+        monkeypatch.setattr(bot_module, "_get_railway_client", fake_get_client)
+        monkeypatch.setattr(bot_module.asyncio, "sleep", fake_sleep)
+        app = MagicMock()
+        app.bot.send_message = AsyncMock()
+        asyncio.run(bot_module._monitor_loop(100, mid, dict(mon, id=mid), app))
+        return [c.args[1] for c in app.bot.send_message.await_args_list]
+
+    def test_found_message_shows_departure_date_and_search_date(self, bot_module, fresh_db, monkeypatch):
+        train = {
+            "number": "056Ч", "brand": "Yo'lovchi",
+            "departureDate": "31.10.2026 21:45", "arrivalDate": "01.11.2026 05:12",
+            "cars": [{"type": "Plaskartli", "freeSeats": 10,
+                      "tariffs": [{"classServiceType": "3П", "freeSeats": 0, "tariff": 177990}]}],
+        }
+        texts = self._run_first_check(bot_module, fresh_db, monkeypatch, train)
+        msg = texts[0]
+        assert "31.10.2026" in msg                  # jo'nash sanasi
+        assert "21:45 → 01.11 05:12" in msg         # tungi poyezd: kelish kuni ham ko'rinadi
+        assert "Toshkent" in msg or "A → B" in msg
+        assert msg.count("📅") >= 2                 # poyezd qatorida ham, oxirgi qatorda ham
+
+    def test_same_day_arrival_shows_time_only(self, bot_module, fresh_db, monkeypatch):
+        train = {
+            "number": "710Ф", "brand": "Sharq",
+            "departureDate": "31.10.2026 08:37", "arrivalDate": "31.10.2026 14:35",
+            "cars": [{"type": "O'rindiqli", "freeSeats": 5,
+                      "tariffs": [{"classServiceType": "2В", "freeSeats": 5, "tariff": 276820}]}],
+        }
+        msg = self._run_first_check(bot_module, fresh_db, monkeypatch, train)[0]
+        assert "08:37 → 14:35" in msg
+
+    def test_no_ticket_message_also_shows_date(self, bot_module, fresh_db, monkeypatch):
+        msg = self._run_first_check(bot_module, fresh_db, monkeypatch, {
+            "number": "X", "brand": "Y", "departureDate": "31.10.2026 08:00",
+            "arrivalDate": "31.10.2026 09:00", "cars": []})[0]
+        assert "mos bilet yo'q" in msg and "31.10.2026" in msg

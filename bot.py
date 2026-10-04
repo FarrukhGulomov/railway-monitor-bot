@@ -1443,6 +1443,23 @@ MAX_CONSECUTIVE_ERRORS_BEFORE_NOTICE = 5
 MAX_ERROR_BACKOFF = 300  # soniya — API xatosi davom etsa kutish shu chegaradan oshmaydi
 
 
+def _fmt_iso_date(iso: str) -> str:
+    """'2026-10-31' -> '31.10.2026' (xabarlarda sana ko'rinishi uchun)."""
+    try:
+        return datetime.strptime(iso, "%Y-%m-%d").strftime("%d.%m.%Y")
+    except (TypeError, ValueError):
+        return iso or "—"
+
+
+def _split_dt(value: str):
+    """'31.10.2026 08:37' -> ('31.10.2026', '08:37'); format boshqacha bo'lsa ('', value)."""
+    value = value or ""
+    if " " in value:
+        d, t = value.split(" ", 1)
+        return d, t
+    return "", value
+
+
 def _train_fingerprint(found_item) -> str:
     """Bitta topilgan (poyezd, variant) juftligini o'ziga xos aniqlaydi —
     shu identifikator orqali ketma-ket tekshiruvlar orasida "bu HAQIQATAN
@@ -1630,21 +1647,25 @@ async def _monitor_loop(uid: int, mid: str, data: dict, app):
                         f"🎯 *Yangi joy topildi! ({len(to_show)} ta variant)*\n"
                     )
                     lines = [header]
-                    prev_number = None
+                    prev_key = None
                     for train, car, price, tariff_seats, service_type in to_show:
-                        dep = train.get("departureDate", "")
-                        arr = train.get("arrivalDate", "")
+                        dep_date, time_str = _split_dt(train.get("departureDate", ""))
+                        arr_date, arr_time = _split_dt(train.get("arrivalDate", ""))
                         number = train.get("number", "")
-                        time_str = dep.split(" ")[1] if " " in dep else dep
-                        arr_str  = arr.split(" ")[1] if " " in arr else arr
-                        if number != prev_number:
-                            lines.append(f"🚂 *{train.get('brand','')} {number}*\n   ⏰ {time_str} → {arr_str}")
-                            prev_number = number
+                        # Kelish boshqa kunga tushsa (tungi poyezd) — kunini ham ko'rsatamiz
+                        arr_str = arr_time if (not arr_date or arr_date == dep_date) else f"{arr_date[:5]} {arr_time}"
+                        key = (number, dep_date, time_str)
+                        if key != prev_key:
+                            lines.append(
+                                f"🚂 *{train.get('brand','')} {number}*\n"
+                                f"   📅 {dep_date or _fmt_iso_date(data.get('date'))}  ⏰ {time_str} → {arr_str}"
+                            )
+                            prev_key = key
                         ctype_label = car.get("type") if isinstance(car, dict) else None
                         label = f"{ctype_label} ({service_type})" if ctype_label and ctype_label != service_type else service_type
                         lines.append(f"   💺 {label}: {tariff_seats} joy | 💰 {price:,} so'm")
 
-                    lines.append(f"\n🚉 {data['from_name']} → {data['to_name']}")
+                    lines.append(f"\n🚉 {data['from_name']} → {data['to_name']}  |  📅 {_fmt_iso_date(data.get('date'))}")
                     lines.append(f"\n👉 [Bilet sotib olish]({link})")
                     if not first_run:
                         lines.append(f"\n_Kuzatuv to'xtatildi: {mid}_")
@@ -1669,7 +1690,8 @@ async def _monitor_loop(uid: int, mid: str, data: dict, app):
                 elif first_run:
                     await app.bot.send_message(
                         uid,
-                        f"ℹ️ Hozircha mos bilet yo'q.\nHar {Config.CHECK_INTERVAL} soniyada kuzatib boraman...\n🆔 `{mid}`",
+                        f"ℹ️ Hozircha mos bilet yo'q.\n🚉 {data['from_name']} → {data['to_name']}  |  📅 {_fmt_iso_date(data.get('date'))}\n"
+                        f"Har {Config.CHECK_INTERVAL} soniyada kuzatib boraman...\n🆔 `{mid}`",
                         parse_mode="Markdown",
                     )
                 # Snapshot'ni HAR DOIM joriy holatga yangilaymiz (topilsin,
