@@ -129,3 +129,72 @@ class TestSearchResultStatus:
         result = client.search_trains("A", "B", "2030-01-01")
         assert result.ok is False
         assert result.trains == []
+
+    def test_latency_is_recorded_on_result(self, monkeypatch):
+        payload = {"data": {"directions": {"forward": {"trains": []}}}}
+        client = _make_client(monkeypatch, [_FakeResponse(200, json_data=payload)])
+        result = client.search_trains("A", "B", "2030-01-01")
+        assert result.latency >= 0.0
+
+
+class TestRetryDoesNotBlockOtherRoutes:
+    """P1 audit: bitta marshrutning retry/backoff KUTISHI (masalan 429 dan
+    keyingi Retry-After) boshqa marshrutlarning HAQIQIY tarmoq so'rovini
+    to'smasligi kerak. Buning uchun REAL (lekin qisqa) time.sleep ishlatiladi
+    — vaqt monkeypatch bilan o'chirilmaydi, aks holda bu xatti-harakatni
+    sinab bo'lmaydi."""
+
+    def test_route_b_completes_while_route_a_is_in_retry_backoff(self, monkeypatch):
+        import threading
+        import time as real_time
+
+        monkeypatch.setattr(RailwayClient, "_init_session", lambda self: None)
+        client = RailwayClient()
+        client.MIN_INTERVAL = 0  # pacing bu testga aloqasi yo'q — faqat lock xatti-harakatini tekshiramiz
+
+        payload_ok = {"data": {"directions": {"forward": {"trains": []}}}}
+        route_a_started = threading.Event()
+
+        class _RoutingSession(_FakeSession):
+            """from_code orqali qaysi marshrut ekanini aniqlab, har biriga
+            boshqa xatti-harakat qaytaradi: A — 429 (REAL ~1s kutish
+            talab qiladi), B — darhol muvaffaqiyatli."""
+
+            def post(self, url, json=None, **kw):
+                from_code = json["directions"]["forward"]["depStationCode"]
+                if from_code == "ROUTE_A":
+                    route_a_started.set()
+                    return _FakeResponse(429, headers={"Retry-After": "1"})
+                return _FakeResponse(200, json_data=payload_ok)
+
+        client._session = _RoutingSession([])
+
+        results = {}
+
+        def run_route_a():
+            # A — 429 oladi, REAL time.sleep(1) bilan backoff qiladi,
+            # keyin retrylar tugab xato bilan qaytadi (test faqat B ning
+            # A dan oldin tugashini tekshiradi, A ning yakuniy natijasi
+            # muhim emas).
+            results["a"] = client.search_trains("ROUTE_A", "X", "2030-01-01")
+
+        thread_a = threading.Thread(target=run_route_a)
+        thread_a.start()
+        assert route_a_started.wait(timeout=2), "Route A so'rovni boshlamadi"
+
+        # A endi 429 dan keyin REAL ~1s backoff'da — shu payt B o'z
+        # so'rovini yuborishi va TEZDA (A ning butun backoff davridan
+        # ANCHA oldin) tugashi kerak, agar lock retry-sleep davomida
+        # band bo'lmasa.
+        b_start = real_time.monotonic()
+        result_b = client.search_trains("ROUTE_B", "Y", "2030-01-01")
+        b_duration = real_time.monotonic() - b_start
+
+        thread_a.join(timeout=10)
+
+        assert result_b.ok is True
+        assert b_duration < 0.5, (
+            f"Route B {b_duration:.2f}s davom etdi — bu Route A ning retry "
+            "backoff kutishi bilan to'silgandek ko'rinadi (session_lock "
+            "retry sleep davomida ushlab turilgan bo'lishi mumkin)"
+        )

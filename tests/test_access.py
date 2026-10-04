@@ -149,3 +149,31 @@ class TestConfigValidateFailsClosed:
                 config.Config.validate()
         finally:
             importlib.reload(config)
+
+    def test_invalid_railway_max_concurrency_blocks_startup(self, monkeypatch, tmp_path):
+        import importlib
+        self._base_env(monkeypatch)
+        monkeypatch.setenv("ADMIN_IDS", "111")
+        monkeypatch.setenv("DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("RAILWAY_MAX_CONCURRENCY", "99")  # ruxsat etilgan chegaradan (5) tashqari
+        import config
+        importlib.reload(config)
+        try:
+            with __import__("pytest").raises(ValueError, match="RAILWAY_MAX_CONCURRENCY"):
+                config.Config.validate()
+        finally:
+            importlib.reload(config)
+
+    def test_invalid_railway_min_request_interval_blocks_startup(self, monkeypatch, tmp_path):
+        import importlib
+        self._base_env(monkeypatch)
+        monkeypatch.setenv("ADMIN_IDS", "111")
+        monkeypatch.setenv("DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("RAILWAY_MIN_REQUEST_INTERVAL", "0.1")  # juda kichik — xushmuomalalikka zid
+        import config
+        importlib.reload(config)
+        try:
+            with __import__("pytest").raises(ValueError, match="RAILWAY_MIN_REQUEST_INTERVAL"):
+                config.Config.validate()
+        finally:
+            importlib.reload(config)

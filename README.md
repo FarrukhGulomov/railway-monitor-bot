@@ -85,6 +85,7 @@ python bot.py
 | `/users` | Qo'shilgan foydalanuvchilar va ularning faoliyati (oxirgi faollik, kuzatuvlar soni) |
 | `/removeUser <id>` | Foydalanuvchini botdan o'chirish |
 | `/logs` | Bot loglarini ko'rish |
+| `/metrics` | Monitoring ko'rsatkichlari (so'rovlar, navbat kutishi, sikl davomiyligi) |
 
 ---
 
@@ -105,6 +106,9 @@ Railway **Variables** bo'limida quyidagilarni qo'ying:
 | `ADMIN_IDS` | Admin Telegram ID lari (vergul bilan) |
 | `TZ` | `Asia/Tashkent` — sana/vaqt O'zbekiston vaqtida ishlashi uchun |
 | `DATA_DIR` | `/data` — ma'lumotlar Volume'da saqlanishi uchun (quyida) |
+| `RAILWAY_MAX_CONCURRENCY` | `2` (standart) — bir vaqtda nechta mustaqil marshrut so'rovi "parvozda" bo'lishi mumkin |
+| `RAILWAY_MIN_REQUEST_INTERVAL` | `5.0` (standart) — so'rovlar orasidagi umumiy minimal oraliq (soniya) |
+| `SEARCH_CACHE_TTL` | `8.0` (standart) — bir xil marshrut/sana so'rovlarini birlashtiruvchi kesh muddati |
 
 ### ⚠️ MUHIM: Railway'da Volume ulash (ma'lumotlar o'chib ketmasligi uchun)
 
@@ -173,6 +177,57 @@ guruhi (do'stlar, oila, yopiq jamoat) uchun production-ready hisoblanadi.
   chegara yo'q. Kichik yopiq foydalanuvchi guruhi uchun bu yetarli deb
   baholandi; agar foydalanuvchilar soni sezilarli o'ssa, qayta ko'rib
   chiqilishi tavsiya etiladi.
+- **Stansiyalar ro'yxati hali statik/qattiq kodlangan** (10 ta shahar,
+  `bot.py` ichidagi `STATIONS` lug'ati). Railway.uz'da barcha stansiyalarni
+  qaytaradigan barqaror, hujjatlashtirilgan "handbook" endpoint borligi
+  ishonchli aniqlanmagan — shunday endpoint "taxmin qilib" production
+  kodga yozish, u o'zgarsa yoki noto'g'ri chiqsa, botni jim buzilishiga
+  olib kelishi mumkin edi. Shu sabab bu funksiya ATAYLAB amalga
+  oshirilmadi (spekulyatsiya emas, aniq cheklov sifatida hujjatlashtirildi).
+  Kelajakda: avval railway.uz veb-ilovasi tarmoq so'rovlarini qo'lda
+  tekshirib, barqaror endpoint topilsa, uni mahalliy keshlanadigan
+  stansiya katalogi orqali (zaxira sifatida joriy 10 ta stansiya bilan)
+  xavfsiz qo'shish mumkin.
+- **`/search_station` yo'q** — yuqoridagi stansiya katalogi bo'lmagani
+  sabab, matn orqali stansiya qidirish hozircha qo'shilmadi (joriy 10 ta
+  stansiya ustida "qidiruv" qiymat qo'shmaydi, Telegram UI'ni keraksiz
+  murakkablashtiradi).
+
+---
+
+## Bilet aniqlash arxitekturasi (ticket detection)
+
+Qisqacha — "bot qanday qilib joy chiqqanini to'g'ri va tezda aniqlaydi":
+
+- **Snapshot solishtiruvi** (`_monitor_loop` ichida): har tekshiruvda
+  "hozir nima bor" oldingi tekshiruvdagi holat bilan solishtiriladi
+  (kumulyativ "qachondir ko'rilganlar" ro'yxati EMAS). Shu orqali joy
+  g'oyib bo'lib qayta paydo bo'lganda (A → yo'q → A) ikkinchi marta ham
+  to'g'ri "yangi" deb aniqlanadi — bu avvalgi versiyadagi P0 xato edi.
+- **Fingerprint identity modeli** (`_train_fingerprint`): poyezd raqami +
+  jo'nash vaqti + xizmat sinfi + narx. Joy soni ATAYLAB kiritilmagan —
+  u beqaror (har tekshiruvda tabiiy o'zgaradi) va fingerprint'ga
+  kiritilsa, har bir son o'zgarishi soxta "yangi bilet" hisoblanardi.
+  Joy sonining `min_seats` chegarasidan o'tish/o'tmasligi buning o'rniga
+  filtr darajasida hal qilinadi.
+- **Monitor tahriri darhol kuchga kiradi**: har tekshiruv SIKLI avval
+  DB'dan eng so'nggi holatni o'qiydi, FAQAT SHUNDAN KEYIN muddat
+  tugash (expiry) qarori qabul qilinadi — aks holda tahrirlangan
+  (masalan ertangi kunga ko'chirilgan) kuzatuv eski holat asosida
+  bekorga to'xtatilib qolishi mumkin edi (P0 xato, tuzatildi).
+- **Scheduler**: bitta umumiy Railway client + route/date single-flight
+  kesh (CHECK_INTERVAL/2 dan oshmaydigan TTL bilan) + bounded concurrency
+  (`RAILWAY_MAX_CONCURRENCY`, FIFO asyncio.Semaphore) + global pacing
+  (`RAILWAY_MIN_REQUEST_INTERVAL`). Bitta marshrutning retry/backoff
+  KUTISHI endi boshqa marshrutlarni to'smaydi (`railway_client.py`dagi
+  pacing/session locklar ajratilgan) — lekin haqiqiy socket I/O hamon
+  ketma-ket (ulashilgan sessiya xavfsizligi uchun ataylab).
+- **API sxema himoyasi** (`_find_all_trains`): tariflari yo'q/bo'sh vagon,
+  noto'g'ri formatdagi narx/joy soni, noma'lum vagon turi kabi holatlar
+  endi funksiyani qulatmaydi va soxta "bilet" sifatida e'lon qilinmaydi —
+  anomaliya bir marta log qilinadi va hisoblagich (`/metrics`) oshiriladi.
+- **`/metrics`** (admin) — so'rovlar/qayta urinishlar/429/timeout soni,
+  navbat kutishi, yuqori oqim javob vaqti, tekshiruv sikli davomiyligi.
 
 ---
 

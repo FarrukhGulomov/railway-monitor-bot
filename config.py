@@ -43,6 +43,37 @@ class Config:
     # Bir foydalanuvchida max monitoring soni
     MAX_MONITORS_PER_USER: int = int(os.getenv("MAX_MONITORS_PER_USER", "3"))
 
+    # ── Railway.uz so'rov rejalashtiruvchisi (scheduler) ──────────────────────────
+    # Bir vaqtda railway.uz'ga nechta MUSTAQIL (turli marshrut/sana) so'rov
+    # "parvoz holatida" bo'lishi mumkinligi. 1 = eski xatti-harakat (to'liq
+    # ketma-ket). Standart 2 — bitta sekin/retry qilayotgan marshrut boshqa
+    # marshrutlarni butunlay to'smasligi uchun, lekin saytga haddan tashqari
+    # yuklama bermaslik uchun hali ham juda kichik.
+    RAILWAY_MAX_CONCURRENCY: int = max(1, int(os.getenv("RAILWAY_MAX_CONCURRENCY", "2")))
+
+    # Haqiqiy HTTP so'rovlar orasidagi minimal oraliq (soniya) — barcha
+    # marshrutlar uchun UMUMIY (global) chegara. Bu railway.uz'ga nisbatan
+    # "xushmuomalalik" chizig'i — konkurrensiya oshsa ham so'rov tezligi
+    # shu chegaradan oshmaydi.
+    RAILWAY_MIN_REQUEST_INTERVAL: float = float(os.getenv("RAILWAY_MIN_REQUEST_INTERVAL", "5.0"))
+
+    # Bir xil marshrut+sana so'rovlarini qisqa vaqt oynasida birlashtiruvchi
+    # (single-flight) kesh muddati (soniya). CHECK_INTERVAL'dan ancha kichik
+    # bo'lishi SHART — aks holda bitta monitorning o'z navbatdagi tekshiruvi
+    # eskirgan keshlangan natija bilan "aldanib" qolishi mumkin (aniqlash
+    # kechikishini sun'iy oshiradi). Shu sabab bot.py buni CHECK_INTERVAL
+    # bilan taqqoslab yana ham qisqartiradi (quyida _effective_cache_ttl()).
+    SEARCH_CACHE_TTL: float = float(os.getenv("SEARCH_CACHE_TTL", "8.0"))
+
+    @classmethod
+    def effective_search_cache_ttl(cls) -> float:
+        """Kesh muddati — sozlangan qiymat bilan CHECK_INTERVAL yarmidan
+        kichigi. Shunda keshlash HECH QACHON monitorning o'z tsikli bo'yicha
+        aniqlash kechikishiga (detection latency) sezilarli ta'sir qilmaydi,
+        faqat turli monitorlarning deyarli bir vaqtdagi bir xil so'rovlarini
+        birlashtiradi (railway.uz'ga ortiqcha zarba bermaslik uchun)."""
+        return max(1.0, min(cls.SEARCH_CACHE_TTL, cls.CHECK_INTERVAL / 2))
+
     @classmethod
     def validate(cls):
         """Ishga tushishdan oldin barcha kritik sozlamalarni tekshiradi.
@@ -82,6 +113,19 @@ class Config:
             errors.append(
                 f"MAX_MONITORS_PER_USER noto'g'ri ({cls.MAX_MONITORS_PER_USER}) — "
                 "1 dan 50 gacha bo'lishi kerak."
+            )
+
+        if not (1 <= cls.RAILWAY_MAX_CONCURRENCY <= 5):
+            errors.append(
+                f"RAILWAY_MAX_CONCURRENCY noto'g'ri ({cls.RAILWAY_MAX_CONCURRENCY}) — "
+                "1 dan 5 gacha bo'lishi kerak (railway.uz'ga haddan tashqari "
+                "yuklama bermaslik uchun yuqori chegara ataylab past qo'yilgan)."
+            )
+
+        if cls.RAILWAY_MIN_REQUEST_INTERVAL < 1.0:
+            errors.append(
+                f"RAILWAY_MIN_REQUEST_INTERVAL juda kichik ({cls.RAILWAY_MIN_REQUEST_INTERVAL}s) — "
+                "kamida 1.0 soniya bo'lishi kerak (railway.uz'ga xushmuomalalik uchun)."
             )
 
         data_dir = cls.DATA_DIR or "."

@@ -27,6 +27,7 @@ from config import Config
 from railway_client import RailwayClient, SearchResult
 from database import Database
 from security import SecurityMiddleware
+from metrics import metrics
 
 # ─── Logging ────────────────────────────────────────────────────────────────────
 # Railway'ning o'z log ko'ruvchisi stdout'ni o'qiydi — bu doim ishlaydi.
@@ -91,6 +92,54 @@ BRAND_FILTERS = {
     "sharq":     ["sharq", "шарк", "шарқ"],
 }
 
+# uid -> set("shu turdagi ctype_raw qiymat allaqachon 'unknown' deb log qilindi")
+# — har bir yangi, tanib bo'lmaydigan vagon turi yozuvini faqat BIR MARTA log
+# qilish uchun (aks holda bir xil anomaliya har tekshiruvda qayta-qayta
+# loglarni to'ldirib yuboradi).
+_logged_unknown_car_types: set = set()
+
+
+def normalize_car_type(raw: str) -> str:
+    """Railway.uz'dan kelgan turli yozilishdagi (lotin/kirill, turli
+    orfografiya) vagon turi matnini bitta aniq kategoriyaga keltiradi:
+    'platskar' | 'coupe' | 'sv' | 'unknown'.
+
+    MUHIM: bu funksiya faqat DIAGNOSTIKA/KUZATUV (anomaliyalarni log qilish,
+    kelajakda yangi yozilishlarni ko'rish) uchun ishlatiladi. `_find_all_trains`
+    ichidagi haqiqiy FILTRLASH mantig'i ataylab o'zgartirilmagan (har bir
+    so'ralgan car_type o'z keyword ro'yxati bo'yicha mustaqil tekshiriladi) —
+    bu orqali mavjud, ishlab turgan filtrlash xatti-harakati 100% saqlanadi.
+
+    Noma'lum qiymat jim tashlab yuborilmaydi — aniq 'unknown' qaytariladi,
+    shunda chaqiruvchi buni ko'rinadigan tarzda log qila oladi."""
+    if not raw or not isinstance(raw, str):
+        return "unknown"
+    text = raw.strip().lower()
+    if not text:
+        return "unknown"
+    for category, keywords in CAR_TYPE_KEYWORDS.items():
+        if category == "any" or not keywords:
+            continue
+        if any(kw in text for kw in keywords):
+            return category
+    return "unknown"
+
+
+def _log_unknown_car_type_once(raw: str, train_number: str = ""):
+    """Tanib bo'lmaydigan vagon turi yozuvini (railway.uz yangi sxema
+    qo'shgan bo'lishi mumkin) bir marta ko'rinadigan tarzda log qiladi va
+    hisoblagichni oshiradi — jim yo'qolib ketmasligi uchun."""
+    key = (raw or "").strip().lower()
+    if key in _logged_unknown_car_types:
+        return
+    _logged_unknown_car_types.add(key)
+    metrics.incr("schema_anomalies_unknown_car_type_total")
+    logger.warning(
+        f"Noma'lum vagon turi yozilishi uchradi: {raw!r} "
+        f"(poyezd {train_number or '?'}) — normalize_car_type'ga yangi "
+        "keyword qo'shish kerak bo'lishi mumkin."
+    )
+
 
 TIME_RANGES = {
     "any":     ("00:00", "23:59", "🕐 Istalgan vaqt"),
@@ -106,18 +155,32 @@ LOCK_FILE = "/tmp/railway_bot.lock"
 db = Database(path=os.path.join(Config.DATA_DIR, "data.json"))
 security = SecurityMiddleware()
 
-# ─── Markaziy Railway API koordinatori ───────────────────────────────────────────
-# Har bir monitor o'zining alohida RailwayClient'ini ochib, bir vaqtda parallel
-# so'rov yuborishining oldini olish uchun: bitta umumiy client (ichida so'rovlarni
-# serializatsiya qiluvchi lock bilan) + bir xil marshrut/sana so'rovlarini qisqa
-# vaqt oynasida birlashtiruvchi (single-flight) keshni ishlatamiz.
+# ─── Markaziy Railway API koordinatori (scheduler) ───────────────────────────────
+# Arxitektura: monitor tasklari → marshrut/sana bo'yicha agregatsiya →
+# deduplikatsiyalangan qidiruv navbati → bounded concurrency → global pacing
+# (railway_client.py ichida) → ulashilgan single-flight kesh.
+#
+# - Har bir monitor o'zining alohida RailwayClient'ini OCHMAYDI — bitta
+#   umumiy client (cookie/XSRF sessiyasi bo'lishiladi).
+# - Bir xil marshrut+sana so'rovlari qisqa oynada (odatda CHECK_INTERVAL'dan
+#   ancha qisqa) bitta natijani bo'lishadi (single-flight + kesh) — railway.uz
+#   ortiqcha so'rov olmaydi.
+# - `_search_semaphore` bir vaqtda nechta MUSTAQIL (turli marshrut/sana)
+#   qidiruv "parvozda" bo'lishi mumkinligini chegaralaydi (RAILWAY_MAX_CONCURRENCY,
+#   standart 2). asyncio.Semaphore ichki navbati FIFO — shuning uchun hech bir
+#   marshrut doimiy ravishda boshqalaridan keyinga surilib qolmaydi (fairness).
+# - Haqiqiy tarmoq so'rovlari esa railway_client.py ichida hali ham umumiy
+#   pacing bilan tartiblanadi (bir vaqtning o'zida socket darajasida bir nechta
+#   so'rov yubormaymiz — ulashilgan sessiya xavfsizligi uchun), LEKIN bitta
+#   marshrutning retry/backoff KUTISHI endi boshqalarni to'smaydi (railway_client.py
+#   ichidagi _pacing_lock/_session_lock ajratilishiga qarang).
 _railway_client: Optional[RailwayClient] = None
 _railway_client_lock = asyncio.Lock()
 
-_SEARCH_CACHE_TTL = 8.0  # soniya — shu oyna ichida bir xil so'rov qayta yuborilmaydi
 _search_cache: dict = {}      # (from,to,date) -> (monotonic_ts, SearchResult)
 _search_inflight: dict = {}   # (from,to,date) -> asyncio.Future
 _search_coord_lock = asyncio.Lock()
+_search_semaphore: Optional[asyncio.Semaphore] = None  # lazy — event loop ichida yaratiladi
 
 # Barcha faol monitor asyncio tasklari — graceful shutdown uchun kuzatiladi
 _monitor_tasks: dict = {}  # mid -> asyncio.Task
@@ -132,15 +195,28 @@ async def _get_railway_client() -> RailwayClient:
     return _railway_client
 
 
+def _get_search_semaphore() -> asyncio.Semaphore:
+    global _search_semaphore
+    if _search_semaphore is None:
+        _search_semaphore = asyncio.Semaphore(Config.RAILWAY_MAX_CONCURRENCY)
+    return _search_semaphore
+
+
 async def _shared_search(client: RailwayClient, from_code: str, to_code: str, date: str) -> SearchResult:
     """Bir nechta monitor bir xil marshrut+sanani deyarli bir vaqtda so'rasa,
-    faqat bitta haqiqiy HTTP so'rov yuboriladi, qolganlari natijani bo'lishadi."""
+    faqat bitta haqiqiy HTTP so'rov yuboriladi, qolganlari natijani bo'lishadi
+    (single-flight). Kesh muddati CHECK_INTERVAL'ga nisbatan chegaralangan
+    (Config.effective_search_cache_ttl) — shuning uchun hech qachon bitta
+    monitorning o'z navbatdagi tekshiruvini sun'iy ravishda kechiktirmaydi,
+    faqat deyarli bir vaqtdagi takroriy so'rovlarni birlashtiradi."""
     key = (from_code, to_code, date)
     now = time.monotonic()
+    ttl = Config.effective_search_cache_ttl()
 
     async with _search_coord_lock:
         cached = _search_cache.get(key)
-        if cached and now - cached[0] < _SEARCH_CACHE_TTL:
+        if cached and now - cached[0] < ttl:
+            metrics.incr("search_cache_hits_total")
             return cached[1]
         fut = _search_inflight.get(key)
         owner = fut is None
@@ -149,13 +225,32 @@ async def _shared_search(client: RailwayClient, from_code: str, to_code: str, da
             _search_inflight[key] = fut
 
     if not owner:
+        # Boshqa monitor allaqachon xuddi shu marshrut+sanani so'ramoqda —
+        # alohida HTTP so'rov yubormasdan, uning natijasini kutib olamiz.
+        metrics.incr("search_singleflight_joins_total")
         return await fut
 
-    try:
-        result = await asyncio.to_thread(client.search_trains, from_code, to_code, date)
-    except Exception as e:
-        logger.error(f"Kutilmagan xato search_trains chaqiruvida: {e}")
-        result = SearchResult(False, [], f"exception: {e}")
+    queue_wait_start = time.monotonic()
+    sem = _get_search_semaphore()
+    async with sem:
+        queue_wait = time.monotonic() - queue_wait_start
+        if queue_wait > 1.0:
+            # Navbatda sezilarli kutish bo'lsa — diagnostika uchun log qilamiz
+            # ("bot nega sekin ishladi" degan savolga javob berish uchun).
+            logger.info(
+                f"Qidiruv navbatida {queue_wait:.2f}s kutildi "
+                f"({from_code}→{to_code} {date}, RAILWAY_MAX_CONCURRENCY={Config.RAILWAY_MAX_CONCURRENCY})"
+            )
+        metrics.set_gauge("search_queue_wait_seconds", queue_wait)
+        metrics.incr("search_dispatched_total")
+
+        try:
+            result = await asyncio.to_thread(client.search_trains, from_code, to_code, date)
+        except Exception as e:
+            logger.error(f"Kutilmagan xato search_trains chaqiruvida: {e}")
+            result = SearchResult(False, [], f"exception: {e}")
+
+    metrics.set_gauge("search_upstream_latency_seconds", result.latency)
 
     async with _search_coord_lock:
         _search_cache[key] = (time.monotonic(), result)
@@ -409,7 +504,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/addUsers — Bir nechta foydalanuvchi qo'shish\n"
         "/users — Foydalanuvchilar va faoliyati\n"
         "/removeUser — Foydalanuvchini o'chirish\n"
-        "/logs — Loglar"
+        "/logs — Loglar\n"
+        "/metrics — Monitoring ko'rsatkichlari"
     ) if is_admin(uid) else ""
     await update.message.reply_text(
         f"Salom, {escape_markdown(user.first_name or '')}! 🚆\n\n"
@@ -442,16 +538,18 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/addUsers `<id1> <id2> ...` — bir nechtasini qo'shish\n"
         "/users — ro'yxat va faoliyat statistikasi\n"
         "/removeUser `<id>` — foydalanuvchini o'chirish\n"
-        "/logs — bot loglari"
+        "/logs — bot loglari\n"
+        "/metrics — monitoring ko'rsatkichlari"
     ) if is_admin(update.effective_user.id) else ""
     await update.message.reply_text(
         "🚆 *Railway Monitor Bot*\n\n"
         "1️⃣ /monitor — sana, marshrut, vaqt tanlang\n"
         "2️⃣ Bot hozirda mavjud biletlarni darhol ko'rsatadi\n"
-        "3️⃣ Har minutda kuzatib, yangi chiqqanda xabar beradi\n"
+        "3️⃣ Muntazam kuzatib, yangi chiqqanda xabar beradi\n"
         "4️⃣ /list — kuzatuvlarni ko'rish, tahrirlash, o'chirish\n\n"
-        "*Interval:* 60 soniyada bir tekshirish\n"
-        "*Limit:* Bir vaqtda 5 ta kuzatuv\n\n"
+        f"*Interval:* ~{Config.CHECK_INTERVAL} soniyada bir tekshirish (yuklama katta "
+        "bo'lsa biroz farq qilishi mumkin)\n"
+        f"*Limit:* Bir vaqtda {Config.MAX_MONITORS_PER_USER} ta kuzatuv\n\n"
         "🔒 /privacy — qanday ma'lumotlaringiz saqlanishi haqida" + extra,
         parse_mode="Markdown",
     )
@@ -499,6 +597,54 @@ async def cmd_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📋 *Bot log (oxirgi {len(last)} qator):*\n\n```\n{text}\n```",
         parse_mode="Markdown",
     )
+
+
+# ─── /metrics ───────────────────────────────────────────────────────────────────
+async def cmd_metrics(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin uchun: bot haqiqatan tez ishlayaptimi — so'rovlar, qayta
+    urinishlar, navbat kutishi, sikl davomiyligi kabi ko'rsatkichlar
+    (process xotirasida, restart'da nolga tushadi)."""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Faqat admin uchun.")
+        return
+    snap = metrics.snapshot()
+    active_monitors = len(db.get_all_active_monitors())
+    unique_routes = len(_search_cache) + len(_search_inflight)
+
+    def g(name, fmt="{}"):
+        val = snap.get(name)
+        return fmt.format(val) if val is not None else "—"
+
+    lines = [
+        "📊 *Monitoring ko'rsatkichlari* (jarayon boshlanganidan beri)\n",
+        f"🔭 Faol kuzatuvlar: {active_monitors}",
+        f"🧭 Noyob marshrut/sana kalitlari (kesh/navbat): {unique_routes}",
+        f"⚙️ RAILWAY_MAX_CONCURRENCY: {Config.RAILWAY_MAX_CONCURRENCY}",
+        f"⏱ RAILWAY_MIN_REQUEST_INTERVAL: {Config.RAILWAY_MIN_REQUEST_INTERVAL}s",
+        "",
+        "*Railway.uz so'rovlari:*",
+        f"  Jami so'rov: {g('railway_requests_total')}",
+        f"  Qayta urinishlar: {g('railway_retries_total')}",
+        f"  429 (rate limit): {g('railway_429_total')}",
+        f"  5xx server xato: {g('railway_5xx_total')}",
+        f"  Timeout: {g('railway_timeouts_total')}",
+        f"  Boshqa exception: {g('railway_exceptions_total')}",
+        f"  Buzilgan JSON: {g('railway_malformed_json_total')}",
+        "",
+        "*Scheduler:*",
+        f"  Dispatch qilingan qidiruvlar: {g('search_dispatched_total')}",
+        f"  Kesh orqali javob berildi: {g('search_cache_hits_total')}",
+        f"  Single-flight qo'shilgan: {g('search_singleflight_joins_total')}",
+        f"  Oxirgi navbat kutishi: {g('last_search_queue_wait_seconds', '{:.2f}s')}",
+        f"  Oxirgi yuqori oqim javobi: {g('last_search_upstream_latency_seconds', '{:.2f}s')}",
+        f"  Oxirgi tekshiruv sikli: {g('last_monitor_cycle_seconds', '{:.2f}s')}",
+        "",
+        "*Sxema anomaliyalari:*",
+        f"  Noma'lum vagon turi: {g('schema_anomalies_unknown_car_type_total')}",
+        f"  Tariflar yo'q/bo'sh: {g('schema_anomalies_missing_tariffs_total')}",
+        f"  Boshqa anomaliyalar: {sum(v for k, v in snap.items() if k.startswith('schema_anomalies_') and k not in ('schema_anomalies_unknown_car_type_total', 'schema_anomalies_missing_tariffs_total'))}",
+    ]
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 # ─── Admin: foydalanuvchilarni boshqarish ───────────────────────────────────────
@@ -1297,8 +1443,31 @@ MAX_ERROR_BACKOFF = 300  # soniya — API xatosi davom etsa kutish shu chegarada
 
 
 def _train_fingerprint(found_item) -> str:
-    """Bitta topilgan variantni o'ziga xos aniqlaydi — xuddi shu joy keyingi
-    tekshiruvda ham bor bo'lsa, uni qayta 'yangi joy topildi' deb yubormaslik uchun."""
+    """Bitta topilgan (poyezd, variant) juftligini o'ziga xos aniqlaydi —
+    shu identifikator orqali ketma-ket tekshiruvlar orasida "bu HAQIQATAN
+    YANGI joymi yoki avvaldan bor edi" deb solishtiramiz.
+
+    ── Identity modeli (ataylab tanlangan) ──────────────────────────────────
+    Kiritilgan: poyezd raqami + jo'nash vaqti + xizmat/tarif sinfi + narx.
+    - Poyezd raqami + jo'nash vaqti — bir xil kunda bir xil raqamli poyezd
+      boshqa vaqtda jo'namaydi, shuning uchun bu ikkisi reys identifikatori.
+    - `service_type` (tarifning classServiceType'i, yo'qsa vagon turi) —
+      bir xil poyezdda bir nechta sinf (Platskart/Kupe/SV/Biznes/VIP va h.k.)
+      bo'lishi mumkin, ular alohida "bilet" sifatida ko'rsatiladi va alohida
+      e'lon qilinishi kerak.
+    - Narx — xuddi shu sinf ichida turli tariflar (masalan chegirmali va
+      to'liq) bo'lishi mumkin; narx o'zgarishi odatda boshqa tarif/joylashuv
+      ekanini anglatadi.
+
+    Kiritilmagan (ataylab): joy soni (tariff_seats) — bu BARQAROR EMAS, har
+    tekshiruvda tabiiy ravishda o'zgarib turadi (1→3→2 va h.k.) va agar
+    fingerprint'ga kiritilsa, HAR BIR son o'zgarishi soxta "yangi bilet"
+    deb hisoblanib, keraksiz bildirishnomalar (va monitorni bekorga
+    to'xtatish) yaratgan bo'lardi. Joy sonining min_seats chegarasidan
+    o'tishi/o'tmasligi — buning o'rniga `_find_all_trains` darajasida (joy
+    yetarli bo'lmasa, variant umuman `found`ga kiritilmaydi) hal qilinadi;
+    shu orqali "1→3 joy, min_seats=2" kabi holatlar ham to'g'ri aniqlanadi,
+    narx/sinf o'zgarmagan taqdirda esa ortiqcha bildirishnoma bo'lmaydi."""
     train, car, price, tariff_seats, service_type = found_item
     return f"{train.get('number')}|{train.get('departureDate')}|{service_type}|{price}"
 
@@ -1310,14 +1479,40 @@ async def _monitor_loop(uid: int, mid: str, data: dict, app):
     consecutive_empty_date_errors = 0
     consecutive_errors = 0
     error_notice_sent = False
-    seen_fingerprints: set = set()
+    # SNAPSHOT modeli (cumulative emas!): bu — "OXIRGI tugallangan tekshiruvda
+    # nimalar bor edi" degan holat, "umuman qachondir ko'rilganmi" emas.
+    # Shu farq muhim: agar joy g'oyib bo'lib, keyin qayta paydo bo'lsa
+    # (A → bo'sh → A), bu snapshot {A}→{}→{A} bo'lib o'zgaradi va ikkinchi
+    # "A" to'g'ri "yangi" deb aniqlanadi. Eski kumulyativ (|=) usul esa "A"
+    # ni abadiy "ko'rilgan" deb saqlab, qayta paydo bo'lishini sezmasdi.
+    previous_fingerprints: set = set()
 
     while db.is_active(mid):
         sleep_duration = Config.CHECK_INTERVAL
+        cycle_start = time.monotonic()
         try:
-            # Sana/vaqt oralig'i o'tib ketganmi tekshirish — sana bugun bo'lsa-da,
-            # belgilangan vaqt oralig'i (time_to) allaqachon o'tib ketgan bo'lishi
-            # mumkin, bu holda ham qidirishning ma'nosi yo'q.
+            # 1) HAR DOIM avval DB'dan eng so'nggi holatni olib kelamiz —
+            # va faqat SHUNDAN KEYIN muddat tugash (expiry) qarorini
+            # qabul qilamiz. Aks holda: foydalanuvchi /list orqali
+            # kuzatuvni (sana/vaqt/filtr) tahrirlasa-yu, ishlab turgan
+            # monitor hali eski (stale) `data` bilan ishlasa, tahrirlangan
+            # kuzatuv ESKI sana/vaqt asosida noto'g'ri "muddati tugadi"
+            # deb bekorga to'xtatilishi mumkin edi.
+            monitors = db.get_active_monitors(uid)
+            current = next((m for m in monitors if m["id"] == mid), None)
+            if current is None:
+                # Boshqa yo'l bilan (foydalanuvchi /stop, admin o'chirgan,
+                # ruxsat bekor qilingan va h.k.) allaqachon faolsiz —
+                # alohida xabar yubormasdan jim tugaymiz (buni amalga
+                # oshirgan kod o'z tasdiqini allaqachon yuborgan).
+                logger.info(f"Monitor endi topilmadi/faol emas, tugadi: mid={mid}")
+                return
+            data = current
+
+            # 2) Muddat tugash (expiry) tekshiruvi — ENDI YANGILANGAN
+            # `data` bilan. Sana bugun bo'lsa-da, belgilangan vaqt
+            # oralig'i (time_to) allaqachon o'tib ketgan bo'lishi mumkin,
+            # bu holda ham qidirishning ma'nosi yo'q.
             try:
                 mon_dt = datetime.strptime(data["date"], "%Y-%m-%d")
                 time_from_str = data.get("time_from", "00:00")
@@ -1352,14 +1547,8 @@ async def _monitor_loop(uid: int, mid: str, data: dict, app):
             except ValueError:
                 pass
 
-            # DB dan yangi ma'lumotlarni olish (tahrirlangan bo'lishi mumkin)
-            monitors = db.get_active_monitors(uid)
-            current = next((m for m in monitors if m["id"] == mid), None)
-            if current:
-                data = current
-
-            # Umumiy koordinator orqali — bir xil marshrut+sanani so'rayotgan
-            # boshqa monitorlar bilan natija bo'lishiladi, alohida HTTP zarba bermaydi
+            # 3) Qidiruv — umumiy koordinator orqali (bir xil marshrut+sanani
+            # so'rayotgan boshqa monitorlar bilan natija bo'lishiladi).
             result = await _shared_search(client, data["from_code"], data["to_code"], data["date"])
             db.increment_check(mid)
 
@@ -1419,66 +1608,83 @@ async def _monitor_loop(uid: int, mid: str, data: dict, app):
                     data.get("min_seats", 1),
                 )
 
-                if found:
-                    fingerprints = {_train_fingerprint(f) for f in found}
-                    new_fingerprints = fingerprints - seen_fingerprints
+                # SNAPSHOT solishtiruvi: "hozir nima bor" ni "oldingi
+                # tekshiruvda nima bor edi"ga solishtiramiz (kumulyativ
+                # "qachondir ko'rilganlar" emas) — shu orqali g'oyib bo'lib
+                # qayta paydo bo'lgan joy to'g'ri "yangi" deb aniqlanadi.
+                current_fingerprints = {_train_fingerprint(f) for f in found}
+                new_fingerprints = current_fingerprints - previous_fingerprints
 
-                    if first_run or new_fingerprints:
-                        # Faqat birinchi safar hammasi, keyingi safarlarda faqat
-                        # HAQIQATAN yangi paydo bo'lgan variantlar ko'rsatiladi —
-                        # avvaldan mavjud bo'lgan joy qayta "yangi" deb yuborilmaydi.
-                        to_show = found if first_run else [
-                            f for f in found if _train_fingerprint(f) in new_fingerprints
-                        ]
-                        link = "https://eticket.railway.uz"
-                        header = (
-                            f"📋 *Hozirda mavjud biletlar ({len(to_show)} ta variant):*\n"
-                            if first_run else
-                            f"🎯 *Yangi joy topildi! ({len(to_show)} ta variant)*\n"
-                        )
-                        lines = [header]
-                        prev_number = None
-                        for train, car, price, tariff_seats, service_type in to_show:
-                            dep = train.get("departureDate", "")
-                            arr = train.get("arrivalDate", "")
-                            number = train.get("number", "")
-                            time_str = dep.split(" ")[1] if " " in dep else dep
-                            arr_str  = arr.split(" ")[1] if " " in arr else arr
-                            if number != prev_number:
-                                lines.append(f"🚂 *{train.get('brand','')} {number}*\n   ⏰ {time_str} → {arr_str}")
-                                prev_number = number
-                            lines.append(f"   💺 {service_type}: {tariff_seats} joy | 💰 {price:,} so'm")
+                if new_fingerprints:
+                    # Faqat birinchi safar HAMMASI, keyingi safarlarda faqat
+                    # HAQIQATAN yangi (oldingi tekshiruvda yo'q edi) paydo
+                    # bo'lgan variantlar ko'rsatiladi.
+                    to_show = found if first_run else [
+                        f for f in found if _train_fingerprint(f) in new_fingerprints
+                    ]
+                    link = "https://eticket.railway.uz"
+                    header = (
+                        f"📋 *Hozirda mavjud biletlar ({len(to_show)} ta variant):*\n"
+                        if first_run else
+                        f"🎯 *Yangi joy topildi! ({len(to_show)} ta variant)*\n"
+                    )
+                    lines = [header]
+                    prev_number = None
+                    for train, car, price, tariff_seats, service_type in to_show:
+                        dep = train.get("departureDate", "")
+                        arr = train.get("arrivalDate", "")
+                        number = train.get("number", "")
+                        time_str = dep.split(" ")[1] if " " in dep else dep
+                        arr_str  = arr.split(" ")[1] if " " in arr else arr
+                        if number != prev_number:
+                            lines.append(f"🚂 *{train.get('brand','')} {number}*\n   ⏰ {time_str} → {arr_str}")
+                            prev_number = number
+                        lines.append(f"   💺 {service_type}: {tariff_seats} joy | 💰 {price:,} so'm")
 
-                        lines.append(f"\n🚉 {data['from_name']} → {data['to_name']}")
-                        lines.append(f"\n👉 [Bilet sotib olish]({link})")
-                        if not first_run:
-                            lines.append(f"\n_Kuzatuv to'xtatildi: {mid}_")
+                    lines.append(f"\n🚉 {data['from_name']} → {data['to_name']}")
+                    lines.append(f"\n👉 [Bilet sotib olish]({link})")
+                    if not first_run:
+                        lines.append(f"\n_Kuzatuv to'xtatildi: {mid}_")
 
-                        await app.bot.send_message(
-                            uid, "\n".join(lines),
-                            parse_mode="Markdown",
-                            disable_web_page_preview=True,
-                        )
-                        seen_fingerprints |= fingerprints
-                        if not first_run:
-                            if not db.deactivate(mid):
-                                logger.critical(
-                                    f"mid={mid}: joy topilgani uchun deactivate yozib "
-                                    "bo'lmadi — DB hali 'faol' deb ko'rsatishi mumkin"
-                                )
-                            logger.info(f"Yangi joy topildi, monitor to'xtatildi: mid={mid}")
-                            return
-                    else:
-                        # Topilgan joylar avval ko'rsatilganlar bilan bir xil —
-                        # hech narsa o'zgarmagan, jim tekshirishda davom etamiz.
-                        seen_fingerprints |= fingerprints
+                    await app.bot.send_message(
+                        uid, "\n".join(lines),
+                        parse_mode="Markdown",
+                        disable_web_page_preview=True,
+                    )
+                    if not first_run:
+                        # Mahsulot qoidasi (ataylab saqlangan): birinchi
+                        # tekshiruvdan KEYIN haqiqatan yangi mos joy
+                        # topilsa, monitor bir marta xabar berib to'xtaydi
+                        # (foydalanuvchi o'zi saytdan sotib oladi).
+                        if not db.deactivate(mid):
+                            logger.critical(
+                                f"mid={mid}: joy topilgani uchun deactivate yozib "
+                                "bo'lmadi — DB hali 'faol' deb ko'rsatishi mumkin"
+                            )
+                        logger.info(f"Yangi joy topildi, monitor to'xtatildi: mid={mid}")
+                        return
                 elif first_run:
                     await app.bot.send_message(
                         uid,
                         f"ℹ️ Hozircha mos bilet yo'q.\nHar {Config.CHECK_INTERVAL} soniyada kuzatib boraman...\n🆔 `{mid}`",
                         parse_mode="Markdown",
                     )
+                # Snapshot'ni HAR DOIM joriy holatga yangilaymiz (topilsin,
+                # topilmasin) — bu eski `seen |= fingerprints` kumulyativ
+                # xatoning aynan o'rnini bosuvchi qator.
+                previous_fingerprints = current_fingerprints
                 first_run = False
+
+            cycle_duration = time.monotonic() - cycle_start
+            metrics.set_gauge("monitor_cycle_seconds", cycle_duration)
+            if cycle_duration > Config.CHECK_INTERVAL:
+                # Va'da qilingan "har N soniyada tekshiraman" bilan haqiqiy
+                # xatti-harakat orasidagi tafovutni ko'rinadigan qilish uchun.
+                logger.warning(
+                    f"mid={mid}: tekshiruv sikli {cycle_duration:.1f}s davom etdi "
+                    f"(va'da qilingan CHECK_INTERVAL={Config.CHECK_INTERVAL}s dan uzoqroq) — "
+                    "navbat/qayta urinish kechikishi haqiqiy monitoring oralig'ini oshirmoqda."
+                )
 
         except asyncio.CancelledError:
             raise
@@ -1509,19 +1715,47 @@ def _time_in_range(dep_date_str: str, t_from: str, t_to: str) -> bool:
         return True
 
 
+# (train_number, anomaly_turi) -> har bir alohida sxema anomaliyasini faqat
+# BIR MARTA log qilish uchun (aks holda bir xil anomaliya har tekshiruv
+# siklida qayta-qayta loglarni to'ldirib yuboradi).
+_logged_schema_anomalies: set = set()
+
+
+def _log_schema_anomaly_once(number: str, kind: str, detail: str):
+    key = (number, kind)
+    if key in _logged_schema_anomalies:
+        return
+    _logged_schema_anomalies.add(key)
+    metrics.incr(f"schema_anomalies_{kind}_total")
+    logger.warning(f"⚠️ API sxema anomaliyasi [{kind}] poyezd {number}: {detail}")
+
+
 def _find_all_trains(trains, car_type, max_price=None, time_from="00:00", time_to="23:59", min_seats=1):
+    """Railway.uz javobidan foydalanuvchi filtriga mos variantlarni ajratadi.
+
+    Himoyalangan (defensive) parsing: API javobi kutilmagan sxemada bo'lsa
+    (tariffs yo'q/bo'sh, narx noto'g'ri formatda va h.k.), funksiya
+    QULAMAYDI va soxta/noaniq ma'lumotli "bilet"ni HAM e'lon qilmaydi —
+    buning o'rniga anomaliyani (bir marta) log qiladi, hisoblagichni
+    oshiradi va o'sha YOZUVNI o'tkazib yuboradi, qolgan ma'lumotlarni
+    ishlashda davom etadi."""
     keywords    = CAR_TYPE_KEYWORDS.get(car_type, [])
     brand_kws   = BRAND_FILTERS.get(car_type)  # None bo'lsa brand filtri yo'q
     results = []
+    trains = trains or []
     logger.info(
         f"Filtr: car_type={car_type}, vaqt={time_from}–{time_to}, "
         f"max_price={max_price}, min_seats={min_seats}, jami={len(trains)}"
     )
 
     for train in trains:
-        dep    = train.get("departureDate", "")
-        brand  = train.get("brand", "").lower()
-        number = train.get("number", "")
+        if not isinstance(train, dict):
+            _log_schema_anomaly_once("?", "malformed_train_entry", f"kutilmagan tur: {type(train).__name__}")
+            continue
+
+        dep    = train.get("departureDate", "") or ""
+        brand  = (train.get("brand") or "").lower()
+        number = train.get("number", "") or "?"
 
         if not _time_in_range(dep, time_from, time_to):
             logger.info(f"  ⏭ {number} — vaqt {dep} oralig'dan tashqarida")
@@ -1531,25 +1765,81 @@ def _find_all_trains(trains, car_type, max_price=None, time_from="00:00", time_t
             logger.info(f"  ⏭ {number} [{train.get('brand')}] — {CAR_TYPES.get(car_type)} emas")
             continue
 
-        cars = train.get("cars", [])
-        if not cars:
+        cars = train.get("cars")
+        if not cars or not isinstance(cars, list):
             logger.info(f"  ⏭ {train.get('brand')} {number} — cars bo'sh")
             continue
 
         for car in cars:
-            free     = car.get("freeSeats", 0)
-            ctype_raw = car.get("type", "")
+            if not isinstance(car, dict):
+                _log_schema_anomaly_once(number, "malformed_car_entry", f"kutilmagan tur: {type(car).__name__}")
+                continue
+
+            free_raw = car.get("freeSeats", 0)
+            try:
+                free = int(free_raw)
+            except (TypeError, ValueError):
+                _log_schema_anomaly_once(number, "malformed_free_seats", f"freeSeats={free_raw!r}")
+                continue
+
+            ctype_raw = car.get("type") or ""
+            if not isinstance(ctype_raw, str):
+                ctype_raw = str(ctype_raw)
             if free <= 0:
                 continue
+
+            # Diagnostika: bu raw qiymat hech qaysi ma'lum kategoriyaga mos
+            # kelmasa, bir marta ko'rinadigan tarzda log qilamiz — lekin
+            # haqiqiy FILTRLASH quyida eski (ishlab turgan) usul bilan davom
+            # etadi, bu funksiya natijasi faqat kuzatuv/diagnostika uchun.
+            if normalize_car_type(ctype_raw) == "unknown" and not brand_kws:
+                _log_unknown_car_type_once(ctype_raw, number)
+
             if keywords and not brand_kws:
                 if not any(kw in ctype_raw.lower() for kw in keywords):
                     logger.info(f"  ⏭ {number} [{ctype_raw}] — tur mos kelmadi")
                     continue
 
-            for tariff in car.get("tariffs", []):
-                price         = tariff.get("tariff", 0)
-                tariff_seats  = tariff.get("freeSeats", free)
-                service_type  = tariff.get("classServiceType", ctype_raw)
+            tariffs = car.get("tariffs")
+            if not tariffs:
+                # Vagonda bo'sh joy bor (freeSeats>0), lekin tarif ro'yxati
+                # yo'q/bo'sh — narx/sinfni ishonchli bilmasdan "bilet" deb
+                # E'LON QILMAYMIZ (noto'g'ri narx ko'rsatish xavfi), lekin
+                # bu holatni ham JIM yo'qotib yubormaymiz — ko'rinadigan
+                # tarzda log qilib, operator keyinchalik sxemani ko'rib
+                # chiqishi mumkin bo'ladi.
+                _log_schema_anomaly_once(
+                    number, "missing_tariffs",
+                    f"car.type={ctype_raw!r} freeSeats={free} lekin tariffs bo'sh/yo'q",
+                )
+                continue
+            if not isinstance(tariffs, list):
+                _log_schema_anomaly_once(number, "malformed_tariffs", f"kutilmagan tur: {type(tariffs).__name__}")
+                continue
+
+            for tariff in tariffs:
+                if not isinstance(tariff, dict):
+                    _log_schema_anomaly_once(number, "malformed_tariff_entry", f"kutilmagan tur: {type(tariff).__name__}")
+                    continue
+
+                price_raw = tariff.get("tariff", 0)
+                try:
+                    price = int(price_raw)
+                except (TypeError, ValueError):
+                    _log_schema_anomaly_once(number, "malformed_price", f"tariff={price_raw!r}")
+                    continue
+
+                seats_raw = tariff.get("freeSeats", free)
+                try:
+                    tariff_seats = int(seats_raw)
+                except (TypeError, ValueError):
+                    _log_schema_anomaly_once(number, "malformed_tariff_seats", f"freeSeats={seats_raw!r}")
+                    continue
+
+                service_type = tariff.get("classServiceType", ctype_raw) or ctype_raw
+                if not isinstance(service_type, str):
+                    service_type = str(service_type)
+
                 if max_price is not None and price > max_price:
                     logger.info(f"  ⏭ {number} [{service_type}] — narx {price:,} > maks {max_price:,}")
                     continue
@@ -1633,6 +1923,7 @@ def main():
     app.add_handler(CommandHandler("privacy", cmd_privacy))
     app.add_handler(CommandHandler("stop",   cmd_stop))
     app.add_handler(CommandHandler("logs",   cmd_logs))
+    app.add_handler(CommandHandler("metrics", cmd_metrics))
     app.add_handler(CommandHandler("list",   cmd_list))
     app.add_handler(monitor_conv)
 
