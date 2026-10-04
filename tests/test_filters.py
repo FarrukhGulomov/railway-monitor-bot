@@ -249,3 +249,54 @@ class TestTrainFingerprint:
             [_train(number="002", cars=[_car()])], "any"
         )[0]
         assert bot_module._train_fingerprint(a) != bot_module._train_fingerprint(b)
+
+
+class TestSilentDropFixAndDiagnostics:
+    """"Yo'lovchi" poyezdlardagi bilet bot tomonidan jim yo'qotilishi muammosi:
+    vagon darajasidagi freeSeats 0 bo'lsa-yu, tarifda joy bor bo'lsa, vagon
+    endi tashlab yuborilmaydi; hech narsa topilmagan poyezdlarning xom
+    ko'rinishi esa (bir marta) diagnostika sifatida log qilinadi."""
+
+    def test_car_level_zero_but_tariff_has_seats_is_found(self, bot_module):
+        car = {
+            "type": "Плацкартный", "freeSeats": 0,
+            "tariffs": [{"tariff": 150_000, "freeSeats": 7, "classServiceType": "Плацкарт"}],
+        }
+        found = bot_module._find_all_trains([_train(cars=[car])], "platskar")
+        assert len(found) == 1
+        assert found[0][3] == 7
+
+    def test_car_level_zero_and_tariff_zero_still_skipped(self, bot_module):
+        car = {
+            "type": "Купе", "freeSeats": 0,
+            "tariffs": [{"tariff": 200_000, "freeSeats": 0, "classServiceType": "Купе"}],
+        }
+        assert bot_module._find_all_trains([_train(cars=[car])], "any") == []
+
+    def test_cars_empty_train_logged_once_with_raw_dump(self, bot_module, caplog):
+        import logging
+        bot_module._diagnosed_trains.clear()
+        train = _train(number="752Ж", brand="Jaloliddin Manguberdi", cars=[])
+        with caplog.at_level(logging.WARNING, logger="railway_bot"):
+            bot_module._find_all_trains([train], "any")
+            bot_module._find_all_trains([train], "any")  # ikkinchi marta — qayta log qilinmaydi
+        diag = [r for r in caplog.records if "DIAGNOSTIKA" in r.getMessage()]
+        assert len(diag) == 1
+        assert "cars_empty" in diag[0].getMessage()
+        assert "752Ж" in diag[0].getMessage()
+
+    def test_sold_out_train_with_cars_gets_diagnosed_for_any_filter(self, bot_module, caplog):
+        import logging
+        bot_module._diagnosed_trains.clear()
+        train = _train(number="125Ч", brand="Yo'lovchi", cars=[_car(free=0)])
+        with caplog.at_level(logging.WARNING, logger="railway_bot"):
+            assert bot_module._find_all_trains([train], "any") == []
+        assert any("no_result_with_cars" in r.getMessage() for r in caplog.records)
+
+    def test_no_diagnostic_noise_when_user_filter_explains_absence(self, bot_module, caplog):
+        import logging
+        bot_module._diagnosed_trains.clear()
+        train = _train(number="125Ч", cars=[_car(ctype="Купе")])
+        with caplog.at_level(logging.WARNING, logger="railway_bot"):
+            bot_module._find_all_trains([train], "sv")  # SV so'ralgan — Kupe mos emas, normal holat
+        assert not any("DIAGNOSTIKA" in r.getMessage() for r in caplog.records)

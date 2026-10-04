@@ -3,6 +3,7 @@
 """
 
 import asyncio
+import json
 import logging
 import sys
 import os
@@ -1730,6 +1731,49 @@ def _log_schema_anomaly_once(number: str, kind: str, detail: str):
     logger.warning(f"⚠️ API sxema anomaliyasi [{kind}] poyezd {number}: {detail}")
 
 
+# Diagnostika: API javobida kutilgan shaklda bo'lmagan / jim o'tkazib yuborilgan
+# poyezdning XOM ko'rinishini (ommaviy bilet ma'lumoti, maxfiy emas) har bir
+# poyezd+sana+sabab uchun faqat BIR MARTA log qiladi — "bilet bor edi, lekin bot
+# topmadi" kabi holatlarda haqiqiy API sxemasini ko'rib, aniq tuzatish uchun.
+_diagnosed_trains: set = set()
+_DIAG_MAX_RAW = 1800
+
+
+def _diagnose_train_once(train: dict, reason: str):
+    key = (train.get("number"), train.get("departureDate"), reason)
+    if key in _diagnosed_trains:
+        return
+    if len(_diagnosed_trains) > 500:
+        _diagnosed_trains.clear()
+    _diagnosed_trains.add(key)
+    metrics.incr(f"diagnosed_trains_{reason}_total")
+    try:
+        raw = json.dumps(train, ensure_ascii=False, default=str)
+    except Exception:
+        raw = repr(train)
+    logger.warning(
+        f"🔎 DIAGNOSTIKA [{reason}] poyezd {train.get('number')} "
+        f"({train.get('brand')}): kalitlar={sorted(train.keys())} "
+        f"raw={raw[:_DIAG_MAX_RAW]}"
+    )
+
+
+def _any_tariff_has_seats(tariffs) -> bool:
+    """Vagon darajasidagi freeSeats 0/yo'q bo'lsa ham, tariflardan birida
+    bo'sh joy bo'lishi mumkin (ba'zi poyezd turlarida joy soni faqat tarif
+    darajasida beriladi). Shunda vagonni jim tashlab yubormaymiz."""
+    if not isinstance(tariffs, list):
+        return False
+    for t in tariffs:
+        if isinstance(t, dict):
+            try:
+                if int(t.get("freeSeats", 0)) > 0:
+                    return True
+            except (TypeError, ValueError):
+                continue
+    return False
+
+
 def _find_all_trains(trains, car_type, max_price=None, time_from="00:00", time_to="23:59", min_seats=1):
     """Railway.uz javobidan foydalanuvchi filtriga mos variantlarni ajratadi.
 
@@ -1768,7 +1812,10 @@ def _find_all_trains(trains, car_type, max_price=None, time_from="00:00", time_t
         cars = train.get("cars")
         if not cars or not isinstance(cars, list):
             logger.info(f"  ⏭ {train.get('brand')} {number} — cars bo'sh")
+            _diagnose_train_once(train, "cars_empty")
             continue
+
+        results_before = len(results)
 
         for car in cars:
             if not isinstance(car, dict):
@@ -1785,7 +1832,8 @@ def _find_all_trains(trains, car_type, max_price=None, time_from="00:00", time_t
             ctype_raw = car.get("type") or ""
             if not isinstance(ctype_raw, str):
                 ctype_raw = str(ctype_raw)
-            if free <= 0:
+            if free <= 0 and not _any_tariff_has_seats(car.get("tariffs")):
+                logger.info(f"  ⏭ {number} [{ctype_raw}] — vagonda bo'sh joy yo'q (freeSeats={free_raw!r})")
                 continue
 
             # Diagnostika: bu raw qiymat hech qaysi ma'lum kategoriyaga mos
@@ -1852,6 +1900,12 @@ def _find_all_trains(trains, car_type, max_price=None, time_from="00:00", time_t
                     continue
                 logger.info(f"  ✅ {number} [{service_type}] {dep} — {tariff_seats} joy, {price:,} so'm")
                 results.append((train, car, price, tariff_seats, service_type))
+
+        if len(results) == results_before and car_type == "any" and max_price is None and min_seats <= 1:
+            # Hech qanday cheklov qo'yilmagan, lekin poyezdning vagonlari bor-u
+            # birorta ham variant chiqmadi — bu "bilet bor edi, bot topmadi"
+            # holatining belgisi bo'lishi mumkin; xom ko'rinishini bir marta log qilamiz.
+            _diagnose_train_once(train, "no_result_with_cars")
 
     return results
 
