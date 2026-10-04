@@ -58,8 +58,17 @@ class TestFindAllTrains:
         trains = [_train(cars=[_car(free=0)])]
         assert bot_module._find_all_trains(trains, "any") == []
 
-    def test_zero_tariff_seats_skipped(self, bot_module):
+    def test_zero_tariff_seats_with_car_level_seats_uses_car_level_count(self, bot_module):
+        # Haqiqiy production API (oddiy yo'lovchi poyezdlari): tarif darajasida
+        # freeSeats=0, haqiqiy son vagon darajasida. Avval bu "joy yo'q" deb
+        # noto'g'ri tashlab yuborilgan (plaskart/kupe topilmagan).
         trains = [_train(cars=[_car(free=3, tariff_seats=0)])]
+        found = bot_module._find_all_trains(trains, "any")
+        assert len(found) == 1
+        assert found[0][3] == 3
+
+    def test_zero_everywhere_is_skipped(self, bot_module):
+        trains = [_train(cars=[_car(free=0, tariff_seats=0)])]
         assert bot_module._find_all_trains(trains, "any") == []
 
     def test_price_cap(self, bot_module):
@@ -300,3 +309,98 @@ class TestSilentDropFixAndDiagnostics:
         with caplog.at_level(logging.WARNING, logger="railway_bot"):
             bot_module._find_all_trains([train], "sv")  # SV so'ralgan — Kupe mos emas, normal holat
         assert not any("DIAGNOSTIKA" in r.getMessage() for r in caplog.records)
+
+
+# Haqiqiy production API javobidan (DIAGNOSTIKA loglari, 31.10.2026 Toshkent→Buxoro)
+# olingan poyezdlar. Oddiy yo'lovchi poyezdlarida tarif darajasidagi freeSeats
+# DOIM 0, haqiqiy joy soni vagon darajasida keladi.
+REAL_PASSENGER_056CH = {
+    "type": "TY", "number": "056Ч", "brand": "Yo'lovchi",
+    "departureDate": "31.10.2026 21:45", "arrivalDate": "01.11.2026 05:12",
+    "cars": [
+        {"type": "Plaskartli", "freeSeats": 174,
+         "tariffs": [{"classServiceType": "3П", "freeSeats": 0, "tariff": 177990}]},
+        {"type": "Kupe", "freeSeats": 12,
+         "tariffs": [{"classServiceType": "2К", "freeSeats": 0, "tariff": 243750}]},
+    ],
+}
+REAL_PASSENGER_072F = {
+    "type": "YLCh", "number": "072Ф", "brand": "Yo'lovchi",
+    "departureDate": "30.10.2026 22:34", "arrivalDate": "31.10.2026 06:28",
+    "cars": [
+        {"type": "Plaskartli", "freeSeats": 88,
+         "tariffs": [{"classServiceType": "3П", "freeSeats": 0, "tariff": 177990}]},
+        {"type": "Kupe", "freeSeats": 61,
+         "tariffs": [{"classServiceType": "2К", "freeSeats": 0, "tariff": 243750}]},
+        {"type": "SV", "freeSeats": 1,
+         "tariffs": [{"classServiceType": "1Л", "freeSeats": 0, "tariff": 430580}]},
+    ],
+}
+# Afrosiyob uslubi: joy soni TARIF darajasida (haqiqiy log: 710Ф [1С] 123 joy, [1В] 13 joy)
+AFROSIYOB_STYLE = {
+    "number": "710Ф", "brand": "Afrosiyob",
+    "departureDate": "31.10.2026 08:37", "arrivalDate": "31.10.2026 12:40",
+    "cars": [{
+        "type": "Biznes", "freeSeats": 136,
+        "tariffs": [
+            {"classServiceType": "1С", "freeSeats": 123, "tariff": 421050},
+            {"classServiceType": "1В", "freeSeats": 13, "tariff": 808830},
+        ],
+    }],
+}
+
+
+class TestRealPassengerTrainPayload:
+    """Foydalanuvchi hisoboti: 31.10 da 'Yo'lovchi' poyezdlardagi plaskart/kupe
+    bot tomonidan topilmadi (faqat Afrosiyob/Sharq topildi). Sabab: tarif
+    darajasidagi freeSeats=0 "joy yo'q" deb talqin qilingan."""
+
+    def test_platskart_found_with_car_level_seat_count(self, bot_module):
+        found = bot_module._find_all_trains([REAL_PASSENGER_056CH], "platskar")
+        assert len(found) == 1
+        _train_, _car_, price, seats, service = found[0]
+        assert (price, seats, service) == (177_990, 174, "3П")
+
+    def test_kupe_found_with_car_level_seat_count(self, bot_module):
+        found = bot_module._find_all_trains([REAL_PASSENGER_056CH], "coupe")
+        assert len(found) == 1
+        assert found[0][3] == 12 and found[0][2] == 243_750
+
+    def test_any_returns_both_platskart_and_kupe(self, bot_module):
+        found = bot_module._find_all_trains([REAL_PASSENGER_056CH], "any")
+        assert {f[4] for f in found} == {"3П", "2К"}
+
+    def test_sv_with_single_seat_found_and_min_seats_respected(self, bot_module):
+        assert len(bot_module._find_all_trains([REAL_PASSENGER_072F], "sv")) == 1
+        # 1 ta joy bor, 2 ta kerak — chiqmasligi kerak
+        assert bot_module._find_all_trains([REAL_PASSENGER_072F], "sv", min_seats=2) == []
+
+    def test_max_price_applies_to_passenger_tariffs(self, bot_module):
+        found = bot_module._find_all_trains([REAL_PASSENGER_056CH], "any", max_price=200_000)
+        assert [f[4] for f in found] == ["3П"]  # kupe (243,750) narx chegarasidan oshadi
+
+    def test_afrosiyob_style_tariff_level_counts_unchanged(self, bot_module):
+        found = bot_module._find_all_trains([AFROSIYOB_STYLE], "any")
+        assert {(f[4], f[3]) for f in found} == {("1С", 123), ("1В", 13)}
+
+    def test_mixed_tariffs_zero_class_stays_sold_out(self, bot_module):
+        # Bir sinfda joy bor, boshqasi rostdan tugagan (0) — 0 ni car-level
+        # son bilan almashtirmaymiz (soxta "joy bor" xabari bo'lmasin).
+        train = dict(AFROSIYOB_STYLE)
+        train["cars"] = [{
+            "type": "Biznes", "freeSeats": 50,
+            "tariffs": [
+                {"classServiceType": "1С", "freeSeats": 50, "tariff": 421050},
+                {"classServiceType": "1В", "freeSeats": 0, "tariff": 808830},
+            ],
+        }]
+        found = bot_module._find_all_trains([train], "any")
+        assert [(f[4], f[3]) for f in found] == [("1С", 50)]
+
+    def test_truly_sold_out_car_still_skipped(self, bot_module):
+        train = dict(REAL_PASSENGER_056CH)
+        train["cars"] = [{
+            "type": "Plaskartli", "freeSeats": 0,
+            "tariffs": [{"classServiceType": "3П", "freeSeats": 0, "tariff": 177990}],
+        }]
+        assert bot_module._find_all_trains([train], "any") == []
