@@ -19,8 +19,20 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt -r requirements-dev.txt
 
+      - name: Dependency conflict check
+        run: pip check
+
       - name: Syntax check
         run: python -m py_compile bot.py database.py config.py security.py railway_client.py
 
       - name: Run tests
         run: pytest -q
+
+      - name: Dependency vulnerability scan (non-blocking)
+        # Ma'lum zaifliklarni ko'rsatib beradi, lekin CI'ni to'xtatmaydi —
+        # yangi/tasdiqlanmagan CVE bazasi noiz-false-positive bilan build'ni
+        # asossiz qizil qilib qo'ymasligi uchun.
+        continue-on-error: true
+        run: |
+          pip install --quiet pip-audit
+          pip-audit -r requirements.txt
