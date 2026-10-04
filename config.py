@@ -37,8 +37,13 @@ class Config:
     # aks holda har redeploy'da foydalanuvchilar va kuzatuvlar o'chib ketadi!
     DATA_DIR: str = os.getenv("DATA_DIR", ".").strip() or "."
 
-    # Monitoring tekshirish oralig'i (soniya), min 30
-    CHECK_INTERVAL: int = max(10, int(os.getenv("CHECK_INTERVAL", "60")))
+    # Monitoring tekshirish oralig'i (soniya) — foydalanuvchi so'rovi bilan 3
+    # soniyaga tushirildi. DIQQAT: bu faqat monitor o'z navbatdagi tekshiruvini
+    # QACHON boshlashini belgilaydi — railway.uz'ga haqiqiy HTTP so'rovlar
+    # tezligi bundan MUSTAQIL, alohida RAILWAY_MIN_REQUEST_INTERVAL (standart
+    # 5s) va single-flight kesh orqali cheklanadi, shuning uchun CHECK_INTERVAL
+    # pastligi saytga haddan tashqari yuklama bermaydi.
+    CHECK_INTERVAL: int = max(3, int(os.getenv("CHECK_INTERVAL", "3")))
 
     # Bir foydalanuvchida max monitoring soni
     MAX_MONITORS_PER_USER: int = int(os.getenv("MAX_MONITORS_PER_USER", "3"))
@@ -101,12 +106,14 @@ class Config:
                 "ADMIN_IDS=<sizning_telegram_id> qo'shing."
             )
 
-        # CHECK_INTERVAL klass atributida allaqachon min 10s ga cheklangan;
+        # CHECK_INTERVAL klass atributida allaqachon min 3s ga cheklangan;
         # bu tekshiruv kelajakda o'sha cheklov olib tashlansa ham himoya beradi.
-        if cls.CHECK_INTERVAL < 10:
+        # Pastligi xavfsiz: haqiqiy so'rov tezligi RAILWAY_MIN_REQUEST_INTERVAL
+        # va single-flight kesh orqali alohida cheklanadi (quyida).
+        if cls.CHECK_INTERVAL < 3:
             errors.append(
                 f"CHECK_INTERVAL juda kichik ({cls.CHECK_INTERVAL}s) — "
-                "kamida 10 soniya bo'lishi kerak (railway.uz'ga bosim tushirmaslik uchun)."
+                "kamida 3 soniya bo'lishi kerak."
             )
 
         if not (1 <= cls.MAX_MONITORS_PER_USER <= 50):
