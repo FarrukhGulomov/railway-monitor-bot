@@ -37,13 +37,13 @@ class Config:
     # aks holda har redeploy'da foydalanuvchilar va kuzatuvlar o'chib ketadi!
     DATA_DIR: str = os.getenv("DATA_DIR", ".").strip() or "."
 
-    # Monitoring tekshirish oralig'i (soniya) — foydalanuvchi so'rovi bilan 3
-    # soniyaga tushirildi. DIQQAT: bu faqat monitor o'z navbatdagi tekshiruvini
+    # Monitoring tekshirish oralig'i (soniya) — standart 5 (foydalanuvchi tanlovi;
+    # minimal 3). DIQQAT: bu faqat monitor o'z navbatdagi tekshiruvini
     # QACHON boshlashini belgilaydi — railway.uz'ga haqiqiy HTTP so'rovlar
     # tezligi bundan MUSTAQIL, alohida RAILWAY_MIN_REQUEST_INTERVAL (standart
     # 5s) va single-flight kesh orqali cheklanadi, shuning uchun CHECK_INTERVAL
     # pastligi saytga haddan tashqari yuklama bermaydi.
-    CHECK_INTERVAL: int = max(3, int(os.getenv("CHECK_INTERVAL", "3")))
+    CHECK_INTERVAL: int = max(3, int(os.getenv("CHECK_INTERVAL", "5")))
 
     # Bir foydalanuvchida max monitoring soni
     MAX_MONITORS_PER_USER: int = int(os.getenv("MAX_MONITORS_PER_USER", "3"))
