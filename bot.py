@@ -46,6 +46,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger("railway_bot")
 
+# MUHIM (xavfsizlik): httpx har bir Telegram so'rovining TO'LIQ URL'ini INFO
+# darajasida log qiladi, URL ichida esa bot tokeni bor
+# (https://api.telegram.org/bot<TOKEN>/sendMessage) — bu token Railway loglariga
+# va admin /logs buyrug'iga tushib qolardi. Shu sabab ularni WARNING'ga tushiramiz.
+for _noisy in ("httpx", "httpcore"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
+
 # ─── States ─────────────────────────────────────────────────────────────────────
 (
     WAIT_FROM, WAIT_TO, WAIT_DATE,
