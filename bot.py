@@ -1640,7 +1640,9 @@ async def _monitor_loop(uid: int, mid: str, data: dict, app):
                         if number != prev_number:
                             lines.append(f"🚂 *{train.get('brand','')} {number}*\n   ⏰ {time_str} → {arr_str}")
                             prev_number = number
-                        lines.append(f"   💺 {service_type}: {tariff_seats} joy | 💰 {price:,} so'm")
+                        ctype_label = car.get("type") if isinstance(car, dict) else None
+                        label = f"{ctype_label} ({service_type})" if ctype_label and ctype_label != service_type else service_type
+                        lines.append(f"   💺 {label}: {tariff_seats} joy | 💰 {price:,} so'm")
 
                     lines.append(f"\n🚉 {data['from_name']} → {data['to_name']}")
                     lines.append(f"\n👉 [Bilet sotib olish]({link})")
@@ -1774,6 +1776,28 @@ def _any_tariff_has_seats(tariffs) -> bool:
     return False
 
 
+def _all_tariffs_zero(tariffs) -> bool:
+    """Barcha tariflarning freeSeats qiymati 0/yo'q/noto'g'rimi?
+
+    HAQIQIY API (diagnostikadan): oddiy yo'lovchi poyezdlarida (Plaskartli/Kupe/SV)
+    tarif darajasidagi freeSeats DOIM 0, haqiqiy bo'sh joy soni esa VAGON
+    darajasidagi freeSeats'da keladi (masalan 143). Afrosiyob/Sharq'da esa
+    aksincha — joy soni tarif (1С/2Е/...) darajasida beriladi. Shu sabab
+    "barcha tarif 0, lekin vagonda joy bor" holatida vagon sonini ishlatamiz;
+    aralash holatda (bir tarifda joy bor, boshqasida 0) esa tarif qiymatiga
+    ishonamiz — 0 bo'lgani rostdan tugagan sinf."""
+    if not isinstance(tariffs, list):
+        return False
+    for t in tariffs:
+        if isinstance(t, dict):
+            try:
+                if int(t.get("freeSeats", 0)) > 0:
+                    return False
+            except (TypeError, ValueError):
+                continue
+    return True
+
+
 def _find_all_trains(trains, car_type, max_price=None, time_from="00:00", time_to="23:59", min_seats=1):
     """Railway.uz javobidan foydalanuvchi filtriga mos variantlarni ajratadi.
 
@@ -1865,6 +1889,7 @@ def _find_all_trains(trains, car_type, max_price=None, time_from="00:00", time_t
                 _log_schema_anomaly_once(number, "malformed_tariffs", f"kutilmagan tur: {type(tariffs).__name__}")
                 continue
 
+            tariffs_all_zero = _all_tariffs_zero(tariffs)
             for tariff in tariffs:
                 if not isinstance(tariff, dict):
                     _log_schema_anomaly_once(number, "malformed_tariff_entry", f"kutilmagan tur: {type(tariff).__name__}")
@@ -1883,6 +1908,10 @@ def _find_all_trains(trains, car_type, max_price=None, time_from="00:00", time_t
                 except (TypeError, ValueError):
                     _log_schema_anomaly_once(number, "malformed_tariff_seats", f"freeSeats={seats_raw!r}")
                     continue
+                if tariff_seats <= 0 < free and tariffs_all_zero:
+                    # Oddiy yo'lovchi poyezdi: tarif darajasida joy soni 0,
+                    # haqiqiy son vagon darajasida (qarang _all_tariffs_zero).
+                    tariff_seats = free
 
                 service_type = tariff.get("classServiceType", ctype_raw) or ctype_raw
                 if not isinstance(service_type, str):
