@@ -195,6 +195,43 @@ class TestMonitorExpiry:
         assert not any("o'tib ketdi" in t for t in texts)
 
 
+class TestEmptyResultsAreSilent:
+    """Bilet/reys topilmasa foydalanuvchiga HECH QANDAY xabar bormasligi kerak
+    (avval 10 ta bo'sh natijadan keyin 'Diqqat' ogohlantirishi yuborilardi)."""
+
+    def test_many_consecutive_empty_results_send_no_message(
+        self, bot_module, fresh_db, monkeypatch
+    ):
+        monkeypatch.setattr(bot_module, "datetime", _fixed_now(bot_module, 2030, 1, 10, 10, 0))
+        calls = {"n": 0}
+
+        async def fake_search(client, *a, **kw):
+            calls["n"] += 1
+            return bot_module.SearchResult(True, [], "")
+
+        async def fake_get_client():
+            return object()
+
+        mon = dict(MON, date="2030-01-10", time_from="00:00", time_to="23:59")
+        mid = fresh_db.save_monitor(100, mon)
+
+        async def fake_sleep(_):
+            if calls["n"] >= 25:
+                fresh_db.deactivate(mid)
+
+        monkeypatch.setattr(bot_module, "_shared_search", fake_search)
+        monkeypatch.setattr(bot_module, "_get_railway_client", fake_get_client)
+        monkeypatch.setattr(bot_module.asyncio, "sleep", fake_sleep)
+
+        app = MagicMock()
+        app.bot.send_message = AsyncMock()
+
+        asyncio.run(bot_module._monitor_loop(100, mid, dict(mon, id=mid), app))
+
+        assert calls["n"] >= 25
+        assert app.bot.send_message.await_args_list == []
+
+
 class TestAvailabilityLifecycle:
     """P0: 'reappearing ticket' snapshot modeli. Eski kumulyativ
     (`seen |= fingerprints`) usul g'oyib bo'lib qaytgan joyni abadiy
@@ -248,7 +285,7 @@ class TestAvailabilityLifecycle:
         # Birinchi tekshiruv bo'sh — "hozircha yo'q", ikkinchisida paydo
         # bo'lgani uchun monitor hali ham "Hozirda mavjud" (first_run)
         # emas, balki keyingi tekshiruvda "Yangi joy topildi" deb topadi.
-        assert any("mos bilet yo'q" in t for t in texts)
+        assert not any("mos bilet yo'q" in t for t in texts)
         assert sum("Yangi joy topildi" in t for t in texts) == 1
 
     def test_a_then_disappears_then_reappears_is_detected_again(
@@ -340,7 +377,7 @@ class TestSeatThreshold:
         texts = [c.args[1] for c in app.bot.send_message.await_args_list]
         # 1 ta joy, min_seats=2 — hali hech narsa ko'rsatilmaydi (birinchi
         # tekshiruv "hozircha mos bilet yo'q" deydi, chunki 1 joy yetarli emas)
-        assert any("mos bilet yo'q" in t for t in texts)
+        assert not any("mos bilet yo'q" in t for t in texts)
         # 3 ta joyga chiqqach — chegaradan o'tdi, aniqlanadi
         assert sum("Yangi joy topildi" in t for t in texts) == 1
 
@@ -431,7 +468,7 @@ class TestMonitorReflectsLiveEdits:
         texts = [c.args[1] for c in app.bot.send_message.await_args_list]
         # 1-tekshiruv: 100_000 so'mlik poyezd hali eski (50_000) chegaradan
         # tashqarida — "hozircha mos bilet yo'q" deb boshlang'ich xabar.
-        assert any("mos bilet yo'q" in t for t in texts)
+        assert not any("mos bilet yo'q" in t for t in texts)
         # 2-tekshiruv: max_price DBda 150_000 ga yangilangan — endi mos keladi
         # va "Yangi joy topildi" deb yuboriladi (restart shart emas edi).
         assert any("Yangi joy topildi" in t for t in texts)
@@ -471,7 +508,7 @@ class TestMonitorReflectsLiveEdits:
         asyncio.run(bot_module._monitor_loop(100, mid, dict(mon, id=mid), app))
 
         texts = [c.args[1] for c in app.bot.send_message.await_args_list]
-        assert any("mos bilet yo'q" in t for t in texts)  # 1-tekshiruv: 3<5, mos emas
+        assert not any("mos bilet yo'q" in t for t in texts)  # 1-tekshiruv: 3<5, mos emas
         assert any("Yangi joy topildi" in t for t in texts)  # 2-tekshiruv: 3>=2, mos
 
     def test_updated_car_type_applied_on_next_check(self, bot_module, fresh_db, monkeypatch):
@@ -513,7 +550,7 @@ class TestMonitorReflectsLiveEdits:
         asyncio.run(bot_module._monitor_loop(100, mid, dict(mon, id=mid), app))
 
         texts = [c.args[1] for c in app.bot.send_message.await_args_list]
-        assert any("mos bilet yo'q" in t for t in texts)  # 1-tekshiruv: SV so'ralgan, Plaskart kelmaydi
+        assert not any("mos bilet yo'q" in t for t in texts)  # 1-tekshiruv: SV so'ralgan, Plaskart kelmaydi
         assert any("Yangi joy topildi" in t for t in texts)  # 2-tekshiruv: platskar'ga o'zgartirilgan
 
     def test_updated_time_range_applied_on_next_check(self, bot_module, fresh_db, monkeypatch):
@@ -550,7 +587,7 @@ class TestMonitorReflectsLiveEdits:
         asyncio.run(bot_module._monitor_loop(100, mid, dict(mon, id=mid), app))
 
         texts = [c.args[1] for c in app.bot.send_message.await_args_list]
-        assert any("mos bilet yo'q" in t for t in texts)  # 06:00-08:00 da 20:00 reys mos emas
+        assert not any("mos bilet yo'q" in t for t in texts)  # 06:00-08:00 da 20:00 reys mos emas
         assert any("Yangi joy topildi" in t for t in texts)  # kechqurungi oraliqqa o'zgartirilgach mos
 
     def test_updated_route_date_used_in_next_search_call(self, bot_module, fresh_db, monkeypatch):
@@ -699,8 +736,8 @@ class TestNotificationShowsDates:
         msg = self._run_first_check(bot_module, fresh_db, monkeypatch, train)[0]
         assert "08:37 → 14:35" in msg
 
-    def test_no_ticket_message_also_shows_date(self, bot_module, fresh_db, monkeypatch):
-        msg = self._run_first_check(bot_module, fresh_db, monkeypatch, {
+    def test_no_ticket_sends_no_message(self, bot_module, fresh_db, monkeypatch):
+        texts = self._run_first_check(bot_module, fresh_db, monkeypatch, {
             "number": "X", "brand": "Y", "departureDate": "31.10.2026 08:00",
-            "arrivalDate": "31.10.2026 09:00", "cars": []})[0]
-        assert "mos bilet yo'q" in msg and "31.10.2026" in msg
+            "arrivalDate": "31.10.2026 09:00", "cars": []})
+        assert texts == []

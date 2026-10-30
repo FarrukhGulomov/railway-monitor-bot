@@ -1501,7 +1501,6 @@ async def _monitor_loop(uid: int, mid: str, data: dict, app):
     client = await _get_railway_client()
     logger.info(f"Monitor boshlandi: uid={uid} mid={mid}")
     first_run = True
-    consecutive_empty_date_errors = 0
     consecutive_errors = 0
     error_notice_sent = False
     # SNAPSHOT modeli (cumulative emas!): bu — "OXIRGI tugallangan tekshiruvda
@@ -1581,7 +1580,6 @@ async def _monitor_loop(uid: int, mid: str, data: dict, app):
                 # Railway.uz bilan bog'lanish/API xatosi — bu HECH QACHON
                 # "joy/bilet yo'q" deb talqin qilinmaydi.
                 consecutive_errors += 1
-                consecutive_empty_date_errors = 0
                 logger.warning(
                     f"mid={mid}: qidiruv muvaffaqiyatsiz ({result.error}), "
                     f"ketma-ket xato={consecutive_errors}"
@@ -1610,23 +1608,8 @@ async def _monitor_loop(uid: int, mid: str, data: dict, app):
 
                 trains = result.trains
 
-                # Agar sayt doimiy bo'sh natija qaytarsa (sana o'tib ketgan yoki
-                # o'sha kunga reyslar tugagan bo'lishi mumkin)
-                if not trains:
-                    consecutive_empty_date_errors += 1
-                    if consecutive_empty_date_errors == 10:
-                        mon_date_str = data.get("date", "")
-                        await app.bot.send_message(
-                            uid,
-                            f"⚠️ Diqqat: 10 marta ketma-ket bo'sh natija.\n"
-                            f"Ehtimol {mon_date_str} sanasi uchun reyslar tugagan.\n\n"
-                            f"Kuzatuv davom etadi — joy chiqsa, avtomatik aniqlanadi.\n🆔 `{mid}`",
-                            parse_mode="Markdown",
-                        )
-                        consecutive_empty_date_errors = 0  # qayta ogohlantirish uchun reset
-                else:
-                    consecutive_empty_date_errors = 0
-
+                # Bo'sh natija (reyslar yo'q / bilet yo'q) — foydalanuvchiga
+                # hech qanday xabar yuborilmaydi: faqat bilet topilganda yoziladi.
                 found = _find_all_trains(
                     trains, data["car_type"], data.get("max_price"),
                     data.get("time_from", "00:00"), data.get("time_to", "23:59"),
@@ -1694,13 +1677,8 @@ async def _monitor_loop(uid: int, mid: str, data: dict, app):
                             )
                         logger.info(f"Yangi joy topildi, monitor to'xtatildi: mid={mid}")
                         return
-                elif first_run:
-                    await app.bot.send_message(
-                        uid,
-                        f"ℹ️ Hozircha mos bilet yo'q.\n🚉 {data['from_name']} → {data['to_name']}  |  📅 {_fmt_iso_date(data.get('date'))}\n"
-                        f"Har {Config.CHECK_INTERVAL} soniyada kuzatib boraman...\n🆔 `{mid}`",
-                        parse_mode="Markdown",
-                    )
+                # Bilet topilmasa — jim turamiz (na birinchi, na keyingi
+                # tekshiruvda xabar yuborilmaydi).
                 # Snapshot'ni HAR DOIM joriy holatga yangilaymiz (topilsin,
                 # topilmasin) — bu eski `seen |= fingerprints` kumulyativ
                 # xatoning aynan o'rnini bosuvchi qator.
