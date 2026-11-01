@@ -404,3 +404,41 @@ class TestRealPassengerTrainPayload:
             "tariffs": [{"classServiceType": "3П", "freeSeats": 0, "tariff": 177990}],
         }]
         assert bot_module._find_all_trains([train], "any") == []
+
+
+# Jaloliddin Manguberdi (Xiva → Buxoro → Samarqand → Toshkent): Biznes/Ekonom sinflari
+MANGUBERDI = {
+    "number": "751M", "brand": "Jaloliddin Manguberdi",
+    "departureDate": "30.11.2026 07:10", "arrivalDate": "30.11.2026 15:22",
+    "cars": [
+        {"type": "Biznes", "freeSeats": 29,
+         "tariffs": [{"classServiceType": "1B", "freeSeats": 29, "tariff": 1006000}]},
+        {"type": "Ekonom", "freeSeats": 152,
+         "tariffs": [{"classServiceType": "2E", "freeSeats": 152, "tariff": 780000}]},
+    ],
+}
+
+
+class TestJaloliddinManguberdi:
+    def test_brand_filter_finds_both_classes(self, bot_module):
+        found = bot_module._find_all_trains([MANGUBERDI], "manguberdi")
+        assert sorted(f[3] for f in found) == [29, 152]
+
+    def test_brand_filter_excludes_other_brands(self, bot_module):
+        other = dict(MANGUBERDI, brand="Afrosiyob", number="778")
+        assert bot_module._find_all_trains([other], "manguberdi") == []
+
+    def test_any_filter_still_includes_it(self, bot_module):
+        assert len(bot_module._find_all_trains([MANGUBERDI], "any")) == 2
+
+    def test_other_brand_filters_exclude_it(self, bot_module):
+        assert bot_module._find_all_trains([MANGUBERDI], "afrosiyob") == []
+        assert bot_module._find_all_trains([MANGUBERDI], "sharq") == []
+
+    def test_route_known_for_brand(self, bot_module):
+        assert "Buxoro" in bot_module._brand_route("Jaloliddin Manguberdi")
+        assert "Samarqand" in bot_module._brand_route("Jaloliddin Manguberdi")
+        assert bot_module._brand_route("Afrosiyob") == ""
+
+    def test_car_type_label_exists(self, bot_module):
+        assert "Manguberdi" in bot_module.CAR_TYPES["manguberdi"]
