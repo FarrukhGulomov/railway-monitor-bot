@@ -17,6 +17,7 @@ from typing import Optional
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
     ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove,
+    BotCommand, BotCommandScopeChat,
 )
 from telegram.helpers import escape_markdown
 from telegram.ext import (
@@ -418,6 +419,17 @@ async def _notify_admins_start(update: Update, context: ContextTypes.DEFAULT_TYP
             logger.warning(f"Admin {aid} ga /start xabari yuborilmadi: {e}")
 
 
+CONTACT_LATER = "⏭ Keyinroq"
+
+
+@restricted
+async def contact_later(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Xo'p, keyinroq ham bo'ladi 👌 /monitor — yangi kuzatuv.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
 @restricted
 async def got_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Foydalanuvchi telefon raqamini ulashganda adminlarga yuborish va saqlash"""
@@ -468,8 +480,10 @@ def _calendar_keyboard(year: int, month: int, nav: bool = True) -> InlineKeyboar
     now = datetime.now().date()
     month_names = ["","Yanvar","Fevral","Mart","Aprel","May","Iyun",
                    "Iyul","Avgust","Sentabr","Oktabr","Noyabr","Dekabr"]
+    at_current_month = (year, month) <= (now.year, now.month)
     rows = [[
-        InlineKeyboardButton("◀️", callback_data=f"cal_prev|{year}|{month}"),
+        InlineKeyboardButton("·", callback_data="cal_ignore") if at_current_month
+        else InlineKeyboardButton("◀️", callback_data=f"cal_prev|{year}|{month}"),
         InlineKeyboardButton(f"{month_names[month]} {year}", callback_data="cal_ignore"),
         InlineKeyboardButton("▶️", callback_data=f"cal_next|{year}|{month}"),
     ],[
@@ -679,17 +693,35 @@ def _step_view(step: str, ud: dict):
     )
 
 
-async def _show_step(update: Update, context: ContextTypes.DEFAULT_TYPE, step: str):
+async def _show_step(update: Update, context: ContextTypes.DEFAULT_TYPE, step: str,
+                     new_message: bool = False):
     """Bosqichni ko'rsatadi (tugma bosilgan bo'lsa xabarni tahrirlaydi,
     matn kiritilgan bo'lsa yangi xabar yuboradi) va suhbat holatini qaytaradi."""
     context.user_data["_step"] = step
     text, markup = _step_view(step, context.user_data)
     q = update.callback_query
-    if q:
+    if q and not new_message:
         await q.edit_message_text(text, reply_markup=markup, parse_mode="Markdown")
     else:
         await update.effective_message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
     return STEP_STATE[step]
+
+
+def _ago(iso: Optional[str]) -> str:
+    """'2 daq oldin' ko'rinishi; noma'lum bo'lsa bo'sh qator."""
+    if not iso:
+        return ""
+    try:
+        sec = int((datetime.now() - datetime.fromisoformat(iso)).total_seconds())
+    except (TypeError, ValueError):
+        return ""
+    if sec < 60:
+        return "hozirgina"
+    if sec < 3600:
+        return f"{sec // 60} daq oldin"
+    if sec < 86400:
+        return f"{sec // 3600} soat oldin"
+    return f"{sec // 86400} kun oldin"
 
 
 def _monitor_summary(m: dict) -> str:
@@ -704,6 +736,7 @@ def _monitor_summary(m: dict) -> str:
         f"  🚂 {CAR_TYPES.get(m.get('car_type','any'), m.get('car_type',''))}\n"
         f"{seats_line}"
         f"  💰 {price} so'm | 🔄 {checks} tekshirildi"
+        + (f" (oxirgisi: {_ago(m.get('last_check'))})" if m.get("last_check") else "")
     )
 
 
@@ -738,12 +771,17 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/help — Yordam\n"
         "/privacy — Maxfiylik siyosati" + extra,
         parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔎 Yangi kuzatuv", callback_data="menu|monitor"),
+             InlineKeyboardButton("📋 Kuzatuvlarim", callback_data="menu|list")],
+        ]),
     )
 
     u = db.get_user(uid)
     if not is_admin(uid) and not (u and u.get("phone")):
         contact_kb = ReplyKeyboardMarkup(
-            [[KeyboardButton("📱 Telefon raqamni ulashish", request_contact=True)]],
+            [[KeyboardButton("📱 Telefon raqamni ulashish", request_contact=True)],
+             [KeyboardButton(CONTACT_LATER)]],
             resize_keyboard=True, one_time_keyboard=True,
         )
         await update.message.reply_text(
@@ -1125,14 +1163,22 @@ async def usr_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def monitor_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     active = db.get_active_monitors(uid)
+    if update.callback_query:
+        await update.callback_query.answer()
     if len(active) >= Config.MAX_MONITORS_PER_USER:
-        await update.message.reply_text(
+        await update.effective_message.reply_text(
             f"⚠️ Maksimal {Config.MAX_MONITORS_PER_USER} ta kuzatuv.\n"
             "/list — ko'rish va o'chirish"
         )
         return ConversationHandler.END
     context.user_data.clear()
-    return await _show_step(update, context, "from")
+    return await _show_step(update, context, "from", new_message=True)
+
+
+@restricted
+async def menu_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+    await cmd_list(update, context)
 
 
 @restricted
@@ -1161,6 +1207,9 @@ async def cal_navigate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     parts = q.data.split("|")
     action, year, month = parts[0], int(parts[1]), int(parts[2])
+    today = datetime.now()
+    if action == "cal_prev" and (year, month) <= (today.year, today.month):
+        return WAIT_DATE  # o'tgan oyga qaytib bo'lmaydi
     if action == "cal_prev":
         month -= 1
         if month < 1: month, year = 12, year - 1
@@ -1403,9 +1452,9 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db.deactivate_expired(datetime.now().strftime("%Y-%m-%d"))  # eski sanalarni avtomatik tozalash
     monitors = db.get_active_monitors(uid)
     if not monitors:
-        await update.message.reply_text("📭 Faol kuzatuv yo'q.\n/monitor — yangi boshlash")
+        await update.effective_message.reply_text("📭 Faol kuzatuv yo'q.\n/monitor — yangi boshlash")
         return
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         f"📊 *Faol kuzatuvlar ({len(monitors)} ta):*\n\n"
         "Boshqarish uchun bitta ID ni tanlang:",
         parse_mode="Markdown",
@@ -2325,6 +2374,39 @@ def _find_all_trains(trains, car_type, max_price=None, time_from="00:00", time_t
 
 
 # ─── Main ────────────────────────────────────────────────────────────────────────
+USER_COMMANDS = [
+    BotCommand("monitor", "Yangi kuzatuv"),
+    BotCommand("list", "Faol kuzatuvlar"),
+    BotCommand("stop", "Barchasini to'xtatish"),
+    BotCommand("help", "Yordam"),
+    BotCommand("privacy", "Maxfiylik siyosati"),
+    BotCommand("cancel", "Joriy amalni bekor qilish"),
+]
+ADMIN_COMMANDS = USER_COMMANDS + [
+    BotCommand("users", "Foydalanuvchilar"),
+    BotCommand("addUser", "Foydalanuvchi qo'shish"),
+    BotCommand("addUsers", "Bir nechta qo'shish"),
+    BotCommand("removeUser", "Foydalanuvchini o'chirish"),
+    BotCommand("logs", "Loglar"),
+    BotCommand("metrics", "Ko'rsatkichlar"),
+]
+
+
+async def _set_commands(app):
+    """Telegram'dagi '/' menyusi: oddiy foydalanuvchiga — asosiy, adminga — kengaytirilgan."""
+    try:
+        await app.bot.set_my_commands(USER_COMMANDS)
+        for aid in _admin_ids():
+            await app.bot.set_my_commands(ADMIN_COMMANDS, scope=BotCommandScopeChat(aid))
+    except Exception as e:
+        logger.warning(f"Buyruqlar menyusini o'rnatib bo'lmadi: {e}")
+
+
+async def _post_init(app):
+    await _set_commands(app)
+    await _resume_monitors(app)
+
+
 async def _resume_monitors(app):
     """Bot (qayta) ishga tushganda data.json dagi faol kuzatuvlarni davom ettirish.
     Aks holda Railway restartidan keyin kuzatuvlar 'faol' ko'rinsa ham ishlamaydi."""
@@ -2350,13 +2432,16 @@ def main():
     app = (
         Application.builder()
         .token(Config.BOT_TOKEN)
-        .post_init(_resume_monitors)
+        .post_init(_post_init)
         .post_shutdown(_shutdown_monitors)
         .build()
     )
 
     monitor_conv = ConversationHandler(
-        entry_points=[CommandHandler("monitor", monitor_start)],
+        entry_points=[
+            CommandHandler("monitor", monitor_start),
+            CallbackQueryHandler(monitor_start, pattern=r"^menu\|monitor$"),
+        ],
         states={
             WAIT_FROM: [CallbackQueryHandler(got_from, pattern=r"^from\|")],
             WAIT_TO:   [CallbackQueryHandler(got_to,   pattern=r"^to\|")],
@@ -2399,6 +2484,7 @@ def main():
     app.add_handler(CommandHandler("metrics", cmd_metrics))
     app.add_handler(CommandHandler("list",   cmd_list))
     app.add_handler(monitor_conv)
+    app.add_handler(CallbackQueryHandler(menu_list, pattern=r"^menu\|list$"))
 
     # Admin: foydalanuvchilarni boshqarish
     app.add_handler(CommandHandler("addUser",    cmd_add_user))
@@ -2425,6 +2511,7 @@ def main():
     # strelkalari va bo'sh kataklar ham ishlashi kerak.
     app.add_handler(CallbackQueryHandler(cal_navigate,   pattern=r"^cal_(prev|next)\|"))
     app.add_handler(CallbackQueryHandler(cal_ignore,     pattern=r"^cal_ignore$"))
+    app.add_handler(MessageHandler(filters.Text([CONTACT_LATER]), contact_later))
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND,
         mgr_edit_text,
