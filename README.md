@@ -10,7 +10,7 @@ O'zbekiston temir yo'llari (`eticket.railway.uz`) da poyezd joylarini kuzatib, j
 
 - ✅ Poyezd joylarini avtomatik kuzatish
 - ✅ Joy chiqqanda darhol Telegram xabar
-- ✅ Vagon turi, narx va joy soni filtri
+- ✅ Poyezd (Afrosiyob, Sharq, J. Manguberdi, oddiy yo'lovchi) va sinf (Platskart, Kupe, SV, Biznes, Ekonom) alohida filtr; narx va joy soni
 - ✅ Bir vaqtda bir nechta marshrut kuzatuvi
 - ✅ Admin panel: foydalanuvchi qo'shish/o'chirish, faoliyatini kuzatish
 - ✅ Fail-closed kirish nazorati (admin ID siz bot ishga tushmaydi)
