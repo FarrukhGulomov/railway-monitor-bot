@@ -232,6 +232,41 @@ class TestEmptyResultsAreSilent:
         assert app.bot.send_message.await_args_list == []
 
 
+class TestFirstCheckFinishesConfirmation:
+    def test_no_tickets_edits_confirmation_once_without_new_message(
+        self, bot_module, fresh_db, monkeypatch
+    ):
+        monkeypatch.setattr(bot_module, "datetime", _fixed_now(bot_module, 2030, 1, 10, 10, 0))
+        calls = {"n": 0}
+
+        async def fake_search(client, *a, **kw):
+            calls["n"] += 1
+            return bot_module.SearchResult(True, [], "")
+
+        async def fake_get_client():
+            return object()
+
+        mon = dict(MON, date="2030-01-10", time_from="00:00", time_to="23:59")
+        mid = fresh_db.save_monitor(100, mon)
+        bot_module._confirm_messages[mid] = (100, 7, f"boshlandi\n{bot_module.CHECKING_LINE}")
+
+        async def fake_sleep(_):
+            if calls["n"] >= 3:
+                fresh_db.deactivate(mid)
+
+        monkeypatch.setattr(bot_module, "_shared_search", fake_search)
+        monkeypatch.setattr(bot_module, "_get_railway_client", fake_get_client)
+        monkeypatch.setattr(bot_module.asyncio, "sleep", fake_sleep)
+        app = MagicMock()
+        app.bot.send_message = AsyncMock()
+        app.bot.edit_message_text = AsyncMock()
+
+        asyncio.run(bot_module._monitor_loop(100, mid, dict(mon, id=mid), app))
+
+        app.bot.send_message.assert_not_awaited()
+        assert app.bot.edit_message_text.await_count == 1  # faqat birinchi tekshiruvda
+
+
 class TestAvailabilityLifecycle:
     """P0: 'reappearing ticket' snapshot modeli. Eski kumulyativ
     (`seen |= fingerprints`) usul g'oyib bo'lib qaytgan joyni abadiy
