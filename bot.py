@@ -62,6 +62,7 @@ for _noisy in ("httpx", "httpcore"):
 
 EDIT_MENU, EDIT_FIELD, EDIT_VALUE = range(7, 10)
 WAIT_CONFIRM = 10
+WAIT_BRAND = 11
 
 # ─── Konstantalar ───────────────────────────────────────────────────────────────
 STATIONS = {
@@ -85,16 +86,27 @@ CAR_TYPES = {
     "afrosiyob": "🚄 Afrosiyob",
     "sharq":     "🚅 Sharq",
     "manguberdi": "🚆 Jaloliddin Manguberdi",
+    "yolovchi":  "🚂 Yo'lovchi (oddiy)",
+    "biznes":    "💼 Biznes",
+    "econom":    "💺 Ekonom",
     "any":       "🔀 Barchasi",
 }
+
+# Poyezd (brend) tanlovi — sinf (vagon turi) dan alohida.
+BRAND_CHOICES = ["any", "afrosiyob", "sharq", "manguberdi", "yolovchi"]
+# Sinf (vagon turi) tanlovi.
+CLASS_CHOICES = ["platskar", "coupe", "sv", "biznes", "econom", "any"]
 
 CAR_TYPE_KEYWORDS = {
     "platskar":  ["o'rindiq", "ўриндиқ", "platskart", "plaskart", "плацкарт", "seat"],
     "coupe":     ["yotoq", "ётоқ", "kupe", "купе", "compart"],
     "sv":        ["sv", "св", "lyuks", "люкс", "vip", "lux"],
+    "biznes":    ["biznes", "business", "бизнес"],
+    "econom":    ["ekonom", "econom", "эконом"],
     "afrosiyob": [],
     "sharq":     [],
     "manguberdi": [],
+    "yolovchi":  [],
     "any":       [],
 }
 
@@ -103,7 +115,23 @@ BRAND_FILTERS = {
     "afrosiyob": ["afrosiyob", "афросиёб"],
     "sharq":     ["sharq", "шарк", "шарқ"],
     "manguberdi": ["manguberdi", "jaloliddin", "мангуберди", "жалолиддин"],
+    "yolovchi":  ["yo'lovchi", "yolovchi", "йўловчи", "пассажир"],
 }
+
+
+def _filter_label(m: dict) -> str:
+    """Kuzatuv filtrining odam o'qiydigan ko'rinishi: 'Poyezd · Sinf'.
+    Eski kuzatuvlarda brend car_type ichida saqlangan — ular ham to'g'ri chiqadi."""
+    car = m.get("car_type", "any")
+    brand = m.get("brand", "any")
+    if car in BRAND_FILTERS and brand == "any":   # eski format
+        brand, car = car, "any"
+    parts = []
+    if brand != "any":
+        parts.append(CAR_TYPES.get(brand, brand))
+    if car != "any":
+        parts.append(CAR_TYPES.get(car, car))
+    return " · ".join(parts) if parts else CAR_TYPES["any"]
 
 # Brend bo'yicha ma'lum yo'nalish (oraliq bekatlar) — xabarda ko'rsatiladi.
 BRAND_ROUTES = {
@@ -561,9 +589,9 @@ def _station_keyboard(prefix: str, exclude: str = "") -> InlineKeyboardMarkup:
 
 
 # ─── /monitor bosqichlari (Orqaga / Bekor qilish bilan) ──────────────────────────
-STEPS = ["from", "to", "date", "car", "time", "price", "seats", "confirm"]
+STEPS = ["from", "to", "date", "brand", "car", "time", "price", "seats", "confirm"]
 STEP_STATE = {
-    "from": WAIT_FROM, "to": WAIT_TO, "date": WAIT_DATE, "car": WAIT_CAR_TYPE,
+    "from": WAIT_FROM, "to": WAIT_TO, "date": WAIT_DATE, "brand": WAIT_BRAND, "car": WAIT_CAR_TYPE,
     "time": WAIT_TIME_RANGE, "price": WAIT_MAX_PRICE, "seats": WAIT_MIN_SEATS,
     "confirm": WAIT_CONFIRM,
 }
@@ -582,15 +610,25 @@ def _with_nav(rows: list, step: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows + [_nav_row(step)])
 
 
+def _brand_keyboard(prefix: str, with_nav_step: Optional[str] = None) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("🔀 Barchasi", callback_data=f"{prefix}|any")],
+        [InlineKeyboardButton("🚄 Afrosiyob", callback_data=f"{prefix}|afrosiyob"),
+         InlineKeyboardButton("🚅 Sharq", callback_data=f"{prefix}|sharq")],
+        [InlineKeyboardButton("🚆 J. Manguberdi", callback_data=f"{prefix}|manguberdi"),
+         InlineKeyboardButton("🚂 Yo'lovchi", callback_data=f"{prefix}|yolovchi")],
+    ]
+    return _with_nav(rows, with_nav_step) if with_nav_step else InlineKeyboardMarkup(rows)
+
+
 def _car_keyboard(prefix: str, with_nav_step: Optional[str] = None) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton("🪑 Platskart", callback_data=f"{prefix}|platskar"),
          InlineKeyboardButton("🛏 Kupe", callback_data=f"{prefix}|coupe")],
         [InlineKeyboardButton("💺 SV", callback_data=f"{prefix}|sv"),
-         InlineKeyboardButton("🚄 Afrosiyob", callback_data=f"{prefix}|afrosiyob")],
-        [InlineKeyboardButton("🚅 Sharq", callback_data=f"{prefix}|sharq"),
-         InlineKeyboardButton("🚆 J. Manguberdi", callback_data=f"{prefix}|manguberdi")],
-        [InlineKeyboardButton("🔀 Barchasi", callback_data=f"{prefix}|any")],
+         InlineKeyboardButton("💼 Biznes", callback_data=f"{prefix}|biznes")],
+        [InlineKeyboardButton("💺 Ekonom", callback_data=f"{prefix}|econom"),
+         InlineKeyboardButton("🔀 Barchasi", callback_data=f"{prefix}|any")],
     ]
     return _with_nav(rows, with_nav_step) if with_nav_step else InlineKeyboardMarkup(rows)
 
@@ -652,14 +690,19 @@ def _step_view(step: str, ud: dict):
             f"✅ *Qayerga:* {ud.get('to_name', '')}\n\n📅 *Sana* tanlang:",
             _calendar_keyboard(now.year, now.month),
         )
+    if step == "brand":
+        return (
+            f"✅ *Sana:* {_fmt_date_wd(ud.get('date'))}\n\n🚆 *Qaysi poyezd?*",
+            _brand_keyboard("brand", "brand"),
+        )
     if step == "car":
         return (
-            f"✅ *Sana:* {_fmt_date_wd(ud.get('date'))}\n\n🚂 *Vagon turi* tanlang:",
+            f"✅ *Poyezd:* {CAR_TYPES.get(ud.get('brand', 'any'))}\n\n💺 *Vagon sinfi* tanlang:",
             _car_keyboard("car", "car"),
         )
     if step == "time":
         return (
-            f"✅ *Vagon:* {CAR_TYPES.get(ud.get('car_type'), '')}\n\n⏰ *Vaqt oralig'i* tanlang:",
+            f"✅ *Tanlov:* {_filter_label(ud)}\n\n⏰ *Vaqt oralig'i* tanlang:",
             _time_keyboard("time", custom=True, with_nav_step="time"),
         )
     if step == "price":
@@ -681,7 +724,7 @@ def _step_view(step: str, ud: dict):
         "📝 *Tekshirib oling:*\n\n"
         f"🚉 {ud.get('from_name', '')} → {ud.get('to_name', '')}\n"
         f"📅 {_fmt_date_wd(ud.get('date'))}\n"
-        f"🚂 {CAR_TYPES.get(ud.get('car_type'), '')}\n"
+        f"🚂 {_filter_label(ud)}\n"
         f"⏰ {ud.get('time_label', '🕐 Istalgan vaqt')}\n"
         f"💰 Maks: {_price_label(ud)}\n"
         f"🎟 Kamida: {ud.get('min_seats', 1)} ta joy",
@@ -733,7 +776,7 @@ def _monitor_summary(m: dict) -> str:
         f"🆔 `{m['id']}`\n"
         f"  🚉 {m['from_name']} → {m['to_name']}\n"
         f"  📅 {_fmt_date_wd(m['date'])} | ⏰ {m.get('time_from','00:00')}–{m.get('time_to','23:59')}\n"
-        f"  🚂 {CAR_TYPES.get(m.get('car_type','any'), m.get('car_type',''))}\n"
+        f"  🚂 {_filter_label(m)}\n"
         f"{seats_line}"
         f"  💰 {price} so'm | 🔄 {checks} tekshirildi"
         + (f" (oxirgisi: {_ago(m.get('last_check'))})" if m.get("last_check") else "")
@@ -1076,7 +1119,7 @@ def _monitor_admin_line(idx: int, m: dict) -> str:
     return (
         f"{idx}. {status} | 🚉 {m.get('from_name','?')} → {m.get('to_name','?')}\n"
         f"    📅 {m.get('date','—')} | ⏰ {m.get('time_from','00:00')}–{m.get('time_to','23:59')}\n"
-        f"    🚂 {CAR_TYPES.get(m.get('car_type','any'), m.get('car_type',''))} | 💰 {price}{seats_text}\n"
+        f"    🚂 {_filter_label(m)} | 💰 {price}{seats_text}\n"
         f"    🔄 {m.get('check_count', 0)} marta tekshirildi | 🕐 tanlagan: {_fmt_dt(m.get('created_at'))}"
     )
 
@@ -1228,6 +1271,15 @@ async def cal_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     _, date_str = q.data.split("|", 1)
     context.user_data["date"] = date_str
+    return await _show_step(update, context, "brand")
+
+
+@restricted
+async def got_brand(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    _, brand = q.data.split("|", 1)
+    context.user_data["brand"] = brand
     return await _show_step(update, context, "car")
 
 
@@ -1407,7 +1459,7 @@ async def _confirm_and_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "uid": uid,
         "from_name": ud["from_name"], "from_code": ud["from_code"],
         "to_name":   ud["to_name"],   "to_code":   ud["to_code"],
-        "date": ud["date"], "car_type": ud["car_type"],
+        "date": ud["date"], "car_type": ud["car_type"], "brand": ud.get("brand", "any"),
         "time_from": time_from, "time_to": time_to, "time_label": time_label,
         "max_price": ud.get("max_price"),
         "min_seats": ud.get("min_seats", 1),
@@ -1430,7 +1482,7 @@ async def _confirm_and_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f"✅ *Kuzatuv boshlandi!*\n\n"
         f"🚉 {ud['from_name']} → {ud['to_name']}\n"
         f"📅 {_fmt_date_wd(ud['date'])}\n"
-        f"🚂 {CAR_TYPES.get(ud['car_type'], ud['car_type'])}\n"
+        f"🚂 {_filter_label(ud)}\n"
         f"⏰ {time_label}\n"
         f"💰 Maks: {price_text}\n"
         f"🎟 Kamida: {min_seats} ta joy\n"
@@ -1465,7 +1517,7 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def _monitors_keyboard(monitors: list) -> InlineKeyboardMarkup:
     rows = []
     for m in monitors:
-        car = CAR_TYPES.get(m.get('car_type', 'any'), '').split(' ', 1)[-1]
+        car = _filter_label(m).split(' ', 1)[-1] if _filter_label(m) else ""
         d = _fmt_date_wd(m['date'])[:5]  # '30.11'
         label = f"{m['from_name'].split()[-1]}→{m['to_name'].split()[-1]} · {d} · {car}"
         rows.append([InlineKeyboardButton(label, callback_data=f"mgr_show|{m['id']}")])
@@ -1555,7 +1607,8 @@ async def mgr_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("📅 Sana",         callback_data=f"mgr_ef|date|{mid}")],
             [InlineKeyboardButton("⏰ Vaqt oralig'i", callback_data=f"mgr_ef|time|{mid}")],
-            [InlineKeyboardButton("🚂 Vagon turi",    callback_data=f"mgr_ef|car|{mid}")],
+            [InlineKeyboardButton("🚆 Poyezd",        callback_data=f"mgr_ef|brand|{mid}")],
+            [InlineKeyboardButton("💺 Vagon sinfi",   callback_data=f"mgr_ef|car|{mid}")],
             [InlineKeyboardButton("💰 Maks narx",     callback_data=f"mgr_ef|price|{mid}")],
             [InlineKeyboardButton("🎟 Joy soni",      callback_data=f"mgr_ef|seats|{mid}")],
             [InlineKeyboardButton("◀️ Orqaga",        callback_data=f"mgr_show|{mid}")],
@@ -1583,9 +1636,14 @@ async def mgr_edit_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "⏰ Yangi vaqt oralig'i:",
             reply_markup=_time_keyboard("mgr_tv", custom=True, with_nav_step=None),
         )
+    elif field == "brand":
+        await q.edit_message_text(
+            "🚆 Yangi poyezd:",
+            reply_markup=_brand_keyboard("mgr_bv"),
+        )
     elif field == "car":
         await q.edit_message_text(
-            "🚂 Yangi vagon turi:",
+            "💺 Yangi vagon sinfi:",
             reply_markup=_car_keyboard("mgr_cv"),
         )
     elif field == "price":
@@ -1634,8 +1692,31 @@ async def mgr_car_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _, car = q.data.split("|", 1)
     mid = context.user_data.get("edit_mid")
     uid = q.from_user.id
-    if db.update_monitor_field(uid, mid, "car_type", car):
-        text, markup = _updated_card(uid, mid, f"✅ Vagon turi yangilandi: {CAR_TYPES[car]}")
+    fields = {"car_type": car}
+    cur = next((x for x in db.get_active_monitors(uid) if x["id"] == mid), None)
+    if cur and cur.get("car_type") in BRAND_FILTERS and cur.get("brand", "any") == "any":
+        # Eski format: brend car_type ichida edi — sinf almashtirilganda brend yo'qolmasin
+        fields["brand"] = cur["car_type"]
+    if db.update_monitor_fields(uid, mid, fields):
+        text, markup = _updated_card(uid, mid, f"✅ Vagon sinfi yangilandi: {CAR_TYPES[car]}")
+        await q.edit_message_text(text, parse_mode="Markdown", reply_markup=markup)
+    else:
+        await q.edit_message_text("⚠️ Vaqtinchalik xatolik — saqlab bo'lmadi. Qaytadan urinib ko'ring.")
+
+
+@restricted
+async def mgr_brand_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    _, brand = q.data.split("|", 1)
+    mid = context.user_data.get("edit_mid")
+    uid = q.from_user.id
+    fields = {"brand": brand}
+    cur = next((x for x in db.get_active_monitors(uid) if x["id"] == mid), None)
+    if cur and cur.get("car_type") in BRAND_FILTERS:
+        fields["car_type"] = "any"  # eski formatdagi brend almashtirildi
+    if db.update_monitor_fields(uid, mid, fields):
+        text, markup = _updated_card(uid, mid, f"✅ Poyezd yangilandi: {CAR_TYPES[brand]}")
         await q.edit_message_text(text, parse_mode="Markdown", reply_markup=markup)
     else:
         await q.edit_message_text("⚠️ Vaqtinchalik xatolik — saqlab bo'lmadi. Qaytadan urinib ko'ring.")
@@ -2028,7 +2109,7 @@ async def _monitor_loop(uid: int, mid: str, data: dict, app):
                 found = _find_all_trains(
                     trains, data["car_type"], data.get("max_price"),
                     data.get("time_from", "00:00"), data.get("time_to", "23:59"),
-                    data.get("min_seats", 1),
+                    data.get("min_seats", 1), brand_filter=data.get("brand", "any"),
                 )
 
                 # SNAPSHOT solishtiruvi: "hozir nima bor" ni "oldingi
@@ -2232,7 +2313,8 @@ def _all_tariffs_zero(tariffs) -> bool:
     return True
 
 
-def _find_all_trains(trains, car_type, max_price=None, time_from="00:00", time_to="23:59", min_seats=1):
+def _find_all_trains(trains, car_type, max_price=None, time_from="00:00", time_to="23:59",
+                     min_seats=1, brand_filter="any"):
     """Railway.uz javobidan foydalanuvchi filtriga mos variantlarni ajratadi.
 
     Himoyalangan (defensive) parsing: API javobi kutilmagan sxemada bo'lsa
@@ -2242,7 +2324,9 @@ def _find_all_trains(trains, car_type, max_price=None, time_from="00:00", time_t
     oshiradi va o'sha YOZUVNI o'tkazib yuboradi, qolgan ma'lumotlarni
     ishlashda davom etadi."""
     keywords    = CAR_TYPE_KEYWORDS.get(car_type, [])
-    brand_kws   = BRAND_FILTERS.get(car_type)  # None bo'lsa brand filtri yo'q
+    # Brend filtri: yangi `brand` maydoni yoki (eski kuzatuvlar uchun) car_type
+    # ichida saqlangan brend. Sinf filtri (keywords) brenddan mustaqil.
+    brand_kws   = BRAND_FILTERS.get(brand_filter) or BRAND_FILTERS.get(car_type)  # None bo'lsa brand filtri yo'q
     results = []
     trains = trains or []
     logger.info(
@@ -2301,7 +2385,7 @@ def _find_all_trains(trains, car_type, max_price=None, time_from="00:00", time_t
             if normalize_car_type(ctype_raw) == "unknown" and not brand_kws:
                 _log_unknown_car_type_once(ctype_raw, number)
 
-            if keywords and not brand_kws:
+            if keywords:
                 if not any(kw in ctype_raw.lower() for kw in keywords):
                     logger.info(f"  ⏭ {number} [{ctype_raw}] — tur mos kelmadi")
                     continue
@@ -2364,7 +2448,7 @@ def _find_all_trains(trains, car_type, max_price=None, time_from="00:00", time_t
                 logger.info(f"  ✅ {number} [{service_type}] {dep} — {tariff_seats} joy, {price:,} so'm")
                 results.append((train, car, price, tariff_seats, service_type))
 
-        if len(results) == results_before and car_type == "any" and max_price is None and min_seats <= 1:
+        if len(results) == results_before and car_type == "any" and brand_filter == "any" and max_price is None and min_seats <= 1:
             # Hech qanday cheklov qo'yilmagan, lekin poyezdning vagonlari bor-u
             # birorta ham variant chiqmadi — bu "bilet bor edi, bot topmadi"
             # holatining belgisi bo'lishi mumkin; xom ko'rinishini bir marta log qilamiz.
@@ -2450,6 +2534,7 @@ def main():
                 CallbackQueryHandler(cal_pick,     pattern=r"^cal_pick\|"),
                 CallbackQueryHandler(cal_ignore,   pattern=r"^cal_ignore$"),
             ],
+            WAIT_BRAND:      [CallbackQueryHandler(got_brand,      pattern=r"^brand\|")],
             WAIT_CAR_TYPE:   [CallbackQueryHandler(got_car_type,   pattern=r"^car\|")],
             WAIT_TIME_RANGE: [
                 CallbackQueryHandler(got_time_range, pattern=r"^time\|"),
@@ -2505,6 +2590,7 @@ def main():
     app.add_handler(CallbackQueryHandler(mgr_edit_field, pattern=r"^mgr_ef\|"))
     app.add_handler(CallbackQueryHandler(mgr_time_value, pattern=r"^mgr_tv\|"))
     app.add_handler(CallbackQueryHandler(mgr_car_value,  pattern=r"^mgr_cv\|"))
+    app.add_handler(CallbackQueryHandler(mgr_brand_value, pattern=r"^mgr_bv\|"))
     app.add_handler(CallbackQueryHandler(mgr_back,       pattern=r"^mgr_back$"))
     app.add_handler(CallbackQueryHandler(mgr_cal_pick,   pattern=r"^cal_pick\|"))
     # Tahrirlash rejimida (ConversationHandler'dan tashqarida) kalendar
