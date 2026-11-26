@@ -692,6 +692,9 @@ class TestNotificationShowsDates:
     """Ko'p kuzatuv bo'lganda natija qaysi sana uchunligi aniq ko'rinishi kerak."""
 
     def _run_first_check(self, bot_module, fresh_db, monkeypatch, train, date="2026-10-31"):
+        # Sana qattiq yozilgani uchun "hozir"ni qotiramiz (aks holda kalendar
+        # o'tgach monitor "muddati tugadi" deb to'xtaydi).
+        monkeypatch.setattr(bot_module, "datetime", _fixed_now(bot_module, 2026, 10, 30, 12, 0))
         mon = dict(MON, date=date)
         mid = fresh_db.save_monitor(100, mon)
 

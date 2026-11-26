@@ -82,6 +82,7 @@ CAR_TYPES = {
     "sv":        "💺 SV / Lyuks",
     "afrosiyob": "🚄 Afrosiyob",
     "sharq":     "🚅 Sharq",
+    "manguberdi": "🚆 Jaloliddin Manguberdi",
     "any":       "🔀 Barchasi",
 }
 
@@ -91,6 +92,7 @@ CAR_TYPE_KEYWORDS = {
     "sv":        ["sv", "св", "lyuks", "люкс", "vip", "lux"],
     "afrosiyob": [],
     "sharq":     [],
+    "manguberdi": [],
     "any":       [],
 }
 
@@ -98,7 +100,21 @@ CAR_TYPE_KEYWORDS = {
 BRAND_FILTERS = {
     "afrosiyob": ["afrosiyob", "афросиёб"],
     "sharq":     ["sharq", "шарк", "шарқ"],
+    "manguberdi": ["manguberdi", "jaloliddin", "мангуберди", "жалолиддин"],
 }
+
+# Brend bo'yicha ma'lum yo'nalish (oraliq bekatlar) — xabarda ko'rsatiladi.
+BRAND_ROUTES = {
+    "manguberdi": "Xiva → Buxoro → Samarqand → Toshkent",
+}
+
+
+def _brand_route(brand: str) -> str:
+    b = (brand or "").lower()
+    for key, route in BRAND_ROUTES.items():
+        if any(kw in b for kw in BRAND_FILTERS.get(key, [])):
+            return route
+    return ""
 
 # uid -> set("shu turdagi ctype_raw qiymat allaqachon 'unknown' deb log qilindi")
 # — har bir yangi, tanib bo'lmaydigan vagon turi yozuvini faqat BIR MARTA log
@@ -988,7 +1004,8 @@ async def cal_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("💺 SV", callback_data="car|sv"),
              InlineKeyboardButton("🚄 Afrosiyob", callback_data="car|afrosiyob")],
             [InlineKeyboardButton("🚅 Sharq", callback_data="car|sharq"),
-             InlineKeyboardButton("🔀 Barchasi", callback_data="car|any")],
+             InlineKeyboardButton("🚆 J. Manguberdi", callback_data="car|manguberdi")],
+            [InlineKeyboardButton("🔀 Barchasi", callback_data="car|any")],
         ]),
         parse_mode="Markdown",
     )
@@ -1265,7 +1282,8 @@ async def mgr_edit_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("💺 SV",        callback_data="mgr_cv|sv"),
                  InlineKeyboardButton("🚄 Afrosiyob", callback_data="mgr_cv|afrosiyob")],
                 [InlineKeyboardButton("🚅 Sharq",     callback_data="mgr_cv|sharq"),
-                 InlineKeyboardButton("🔀 Barchasi",  callback_data="mgr_cv|any")],
+                 InlineKeyboardButton("🚆 J. Manguberdi", callback_data="mgr_cv|manguberdi")],
+                [InlineKeyboardButton("🔀 Barchasi",  callback_data="mgr_cv|any")],
             ]),
         )
     elif field == "price":
@@ -1646,9 +1664,11 @@ async def _monitor_loop(uid: int, mid: str, data: dict, app):
                         arr_str = arr_time if (not arr_date or arr_date == dep_date) else f"{arr_date[:5]} {arr_time}"
                         key = (number, dep_date, time_str)
                         if key != prev_key:
+                            route = _brand_route(train.get("brand"))
                             lines.append(
                                 f"🚂 *{train.get('brand','')} {number}*\n"
-                                f"   📅 {dep_date or _fmt_iso_date(data.get('date'))}  ⏰ {time_str} → {arr_str}"
+                                + (f"   🛤 {route}\n" if route else "")
+                                + f"   📅 {dep_date or _fmt_iso_date(data.get('date'))}  ⏰ {time_str} → {arr_str}"
                             )
                             prev_key = key
                         ctype_label = car.get("type") if isinstance(car, dict) else None
