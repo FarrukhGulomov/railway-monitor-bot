@@ -47,7 +47,7 @@ class TestCommandsMenu:
     def test_admin_menu_is_superset_of_user_menu(self, bot_module):
         user = {c.command for c in bot_module.USER_COMMANDS}
         admin = {c.command for c in bot_module.ADMIN_COMMANDS}
-        assert user < admin and {"users", "addUser", "logs"} <= admin
+        assert user < admin and {"users", "adduser", "logs"} <= admin
 
     def test_set_commands_sets_default_and_per_admin(self, bot_module, monkeypatch):
         monkeypatch.setattr(bot_module.Config, "ADMIN_IDS", [7, 8])
@@ -72,3 +72,10 @@ class TestStartMenu:
         markup = update.message.reply_text.await_args_list[0].kwargs["reply_markup"]
         datas = [b.callback_data for row in markup.inline_keyboard for b in row]
         assert "menu|monitor" in datas and "menu|list" in datas
+
+
+class TestCommandNamesValidForTelegram:
+    def test_all_menu_commands_match_telegram_rules(self, bot_module):
+        import re
+        for c in bot_module.ADMIN_COMMANDS:
+            assert re.fullmatch(r"[a-z0-9_]{1,32}", c.command), c.command
