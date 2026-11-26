@@ -2384,9 +2384,9 @@ USER_COMMANDS = [
 ]
 ADMIN_COMMANDS = USER_COMMANDS + [
     BotCommand("users", "Foydalanuvchilar"),
-    BotCommand("addUser", "Foydalanuvchi qo'shish"),
-    BotCommand("addUsers", "Bir nechta qo'shish"),
-    BotCommand("removeUser", "Foydalanuvchini o'chirish"),
+    BotCommand("adduser", "Foydalanuvchi qo'shish"),
+    BotCommand("addusers", "Bir nechta qo'shish"),
+    BotCommand("removeuser", "Foydalanuvchini o'chirish"),
     BotCommand("logs", "Loglar"),
     BotCommand("metrics", "Ko'rsatkichlar"),
 ]
