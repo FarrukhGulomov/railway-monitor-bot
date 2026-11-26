@@ -74,7 +74,10 @@ class TestCmdStart:
         assert len(sends) == 1
         assert sends[0].args[0] == 111
         assert "ruxsatsiz" in sends[0].args[1]
-        update.message.reply_text.assert_awaited_once_with("⛔ Sizga ruxsat yo'q.")
+        update.message.reply_text.assert_awaited_once()
+        denied = update.message.reply_text.await_args.args[0]
+        assert "Sizga ruxsat yo'q" in denied
+        assert "999" in denied  # foydalanuvchi o'z ID'sini ko'radi — adminga yubora oladi
 
     def test_markdown_unsafe_name_escaped(self, bot_module, fresh_db):
         bot_module.Config.ADMIN_IDS = [111]
@@ -341,7 +344,10 @@ class TestAccessRevocationBlocksCallbacks:
 
         asyncio.run(bot_module.got_contact(update, context))
 
-        update.message.reply_text.assert_awaited_once_with("⛔ Sizga ruxsat yo'q.")
+        update.message.reply_text.assert_awaited_once()
+        denied = update.message.reply_text.await_args.args[0]
+        assert "Sizga ruxsat yo'q" in denied
+        assert "999" in denied  # foydalanuvchi o'z ID'sini ko'radi — adminga yubora oladi
         assert fresh_db.get_user(999).get("phone") is None
 
     def test_authorized_user_still_works_on_same_callbacks(self, bot_module, fresh_db):

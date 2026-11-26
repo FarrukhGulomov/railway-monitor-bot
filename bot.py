@@ -332,6 +332,14 @@ def _admin_ids() -> list[int]:
 
 
 # ─── Dekoratorlar ───────────────────────────────────────────────────────────────
+def _no_access_text(uid: int) -> str:
+    return (
+        "⛔ Sizga ruxsat yo'q.\n\n"
+        f"Sizning Telegram ID: `{uid}`\n"
+        "Kirish uchun shu raqamni bot adminiga yuboring."
+    )
+
+
 def restricted(func):
     """Har bir handler — matn buyrug'i BO'LSIN, inline tugma bosilishi
     BO'LSIN — shu orqali o'tishi kerak. Bu callback handlerlar (/list va
@@ -350,7 +358,8 @@ def restricted(func):
                 except Exception:
                     pass
             else:
-                await update.effective_message.reply_text("⛔ Sizga ruxsat yo'q.")
+                await update.effective_message.reply_text(
+                    _no_access_text(uid), parse_mode="Markdown")
             return ConversationHandler.END
         if not db.touch_user_activity(uid):
             logger.warning(f"Faollik statistikasi saqlanmadi (DB write xato): uid={uid}")
@@ -517,7 +526,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not has_access(uid):
         logger.warning(f"Ruxsatsiz: uid={uid}")
-        await update.message.reply_text("⛔ Sizga ruxsat yo'q.")
+        await update.message.reply_text(_no_access_text(uid), parse_mode="Markdown")
         return
     if not db.touch_user_activity(uid):
         logger.warning(f"Faollik statistikasi saqlanmadi (DB write xato): uid={uid}")
@@ -1119,6 +1128,30 @@ async def got_min_seats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+# mid -> (chat_id, message_id, matn): kuzatuv yaratilgandagi tasdiq xabari.
+# Birinchi tekshiruvda bilet topilmasa, yangi xabar yubormasdan shu xabarning
+# o'zi tahrirlanadi ("hozircha mos bilet yo'q") — foydalanuvchi jimlikdan
+# adashmaydi, lekin spam ham bo'lmaydi.
+_confirm_messages: dict = {}
+
+CHECKING_LINE = "⏳ Hozirgi mavjud biletlar tekshirilmoqda..."
+NOTHING_YET_LINE = "🔎 Tekshirildi — hozircha mos bilet yo'q. Chiqishi bilan darhol xabar beraman."
+
+
+async def _finish_confirm_message(app, mid: str, found_any: bool):
+    entry = _confirm_messages.pop(mid, None)
+    if not entry:
+        return
+    chat_id, message_id, text = entry
+    new_line = "✅ Tekshirildi — mavjud biletlar yuqoridagi xabarda." if found_any else NOTHING_YET_LINE
+    new_text = text.replace(CHECKING_LINE, new_line) if text else new_line
+    try:
+        await app.bot.edit_message_text(
+            new_text, chat_id=chat_id, message_id=message_id, parse_mode="Markdown")
+    except Exception as e:
+        logger.info(f"Tasdiq xabarini tahrirlab bo'lmadi: {e}")
+
+
 async def _confirm_and_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     ud = context.user_data
@@ -1148,18 +1181,22 @@ async def _confirm_and_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     price_text = f"{ud['max_price']:,} so'm" if ud.get("max_price") else "Cheksiz"
     min_seats = ud.get("min_seats", 1)
-    await update.message.reply_text(
+    confirm_text = (
         f"✅ *Kuzatuv boshlandi!*\n\n"
         f"🚉 {ud['from_name']} → {ud['to_name']}\n"
-        f"📅 {ud['date']}\n"
+        f"📅 {_fmt_iso_date(ud['date'])}\n"
         f"🚂 {CAR_TYPES.get(ud['car_type'], ud['car_type'])}\n"
         f"⏰ {time_label}\n"
         f"💰 Maks: {price_text}\n"
         f"🎟 Kamida: {min_seats} ta joy\n"
         f"🆔 `{mid}`\n\n"
-        "⏳ Hozirgi mavjud biletlar tekshirilmoqda...",
-        parse_mode="Markdown",
+        f"{CHECKING_LINE}"
     )
+    sent = await update.message.reply_text(confirm_text, parse_mode="Markdown")
+    chat_id = getattr(sent, "chat_id", None)
+    message_id = getattr(sent, "message_id", None)
+    if isinstance(chat_id, int) and isinstance(message_id, int):
+        _confirm_messages[mid] = (chat_id, message_id, confirm_text)
     _spawn_monitor(uid, mid, monitor, context.application)
 
 
@@ -1463,6 +1500,26 @@ async def error_handler(update, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Xato: {context.error}", exc_info=context.error)
 
 
+TELEGRAM_SAFE_LEN = 3500  # Telegram chegarasi 4096; Markdown/emoji uchun zaxira
+
+
+def _chunk_message(lines: list, limit: int = TELEGRAM_SAFE_LEN) -> list:
+    """Satrlarni Telegram chegarasidan oshmaydigan bo'laklarga ajratadi
+    (satr o'rtasidan kesmaydi). Uzun javob umuman yetib bormay qolishining
+    oldini oladi."""
+    chunks, cur, cur_len = [], [], 0
+    for line in lines:
+        add = len(line) + 1
+        if cur and cur_len + add > limit:
+            chunks.append("\n".join(cur))
+            cur, cur_len = [], 0
+        cur.append(line)
+        cur_len += add
+    if cur:
+        chunks.append("\n".join(cur))
+    return chunks
+
+
 # ─── Monitor loop ────────────────────────────────────────────────────────────────
 MAX_CONSECUTIVE_ERRORS_BEFORE_NOTICE = 5
 MAX_ERROR_BACKOFF = 300  # soniya — API xatosi davom etsa kutish shu chegaradan oshmaydi
@@ -1680,11 +1737,12 @@ async def _monitor_loop(uid: int, mid: str, data: dict, app):
                     if not first_run:
                         lines.append(f"\n_Kuzatuv to'xtatildi: {mid}_")
 
-                    await app.bot.send_message(
-                        uid, "\n".join(lines),
-                        parse_mode="Markdown",
-                        disable_web_page_preview=True,
-                    )
+                    for part in _chunk_message(lines):
+                        await app.bot.send_message(
+                            uid, part,
+                            parse_mode="Markdown",
+                            disable_web_page_preview=True,
+                        )
                     if not first_run:
                         # Mahsulot qoidasi (ataylab saqlangan): birinchi
                         # tekshiruvdan KEYIN haqiqatan yangi mos joy
@@ -1699,6 +1757,8 @@ async def _monitor_loop(uid: int, mid: str, data: dict, app):
                         return
                 # Bilet topilmasa — jim turamiz (na birinchi, na keyingi
                 # tekshiruvda xabar yuborilmaydi).
+                if first_run:
+                    await _finish_confirm_message(app, mid, bool(found))
                 # Snapshot'ni HAR DOIM joriy holatga yangilaymiz (topilsin,
                 # topilmasin) — bu eski `seen |= fingerprints` kumulyativ
                 # xatoning aynan o'rnini bosuvchi qator.
@@ -2055,6 +2115,10 @@ def main():
     app.add_handler(CallbackQueryHandler(mgr_car_value,  pattern=r"^mgr_cv\|"))
     app.add_handler(CallbackQueryHandler(mgr_back,       pattern=r"^mgr_back$"))
     app.add_handler(CallbackQueryHandler(mgr_cal_pick,   pattern=r"^cal_pick\|"))
+    # Tahrirlash rejimida (ConversationHandler'dan tashqarida) kalendar
+    # strelkalari va bo'sh kataklar ham ishlashi kerak.
+    app.add_handler(CallbackQueryHandler(cal_navigate,   pattern=r"^cal_(prev|next)\|"))
+    app.add_handler(CallbackQueryHandler(cal_ignore,     pattern=r"^cal_ignore$"))
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND,
         mgr_edit_text,
