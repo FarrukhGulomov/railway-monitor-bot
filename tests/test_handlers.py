@@ -251,7 +251,7 @@ class TestMonitorFlowSeats:
         prompt = update.message.reply_text.await_args_list[0].args[0]
         assert "joy" in prompt.lower()
 
-    def test_skip_seats_defaults_to_one_and_starts_monitor(self, bot_module, fresh_db, monkeypatch):
+    def test_skip_seats_defaults_to_one_then_confirm_starts_monitor(self, bot_module, fresh_db, monkeypatch):
         bot_module.Config.ADMIN_IDS = [999]
         bot_module.Config.ALLOWED_USERS = []
         monkeypatch.setattr(bot_module, "_spawn_monitor", lambda *a, **kw: None)
@@ -261,7 +261,17 @@ class TestMonitorFlowSeats:
 
         state = asyncio.run(bot_module.got_min_seats(update, context))
 
-        assert state == bot_module.ConversationHandler.END
+        # Endi darhol boshlanmaydi — avval tasdiqlash bosqichi
+        assert state == bot_module.WAIT_CONFIRM
+        assert fresh_db.get_active_monitors(999) == []
+        assert "Tekshirib oling" in update.message.reply_text.await_args.args[0]
+
+        cb_update, q = _make_callback_update(uid=999, data="go|start")
+        cb_update.effective_message = MagicMock()
+        cb_update.effective_message.reply_text = AsyncMock()
+        end = asyncio.run(bot_module.go_confirm(cb_update, context))
+
+        assert end == bot_module.ConversationHandler.END
         monitors = fresh_db.get_active_monitors(999)
         assert len(monitors) == 1
         assert monitors[0]["min_seats"] == 1
@@ -275,6 +285,10 @@ class TestMonitorFlowSeats:
         context.user_data = dict(self._base_user_data(), max_price=None)
 
         asyncio.run(bot_module.got_min_seats(update, context))
+        cb_update, q = _make_callback_update(uid=999, data="go|start")
+        cb_update.effective_message = MagicMock()
+        cb_update.effective_message.reply_text = AsyncMock()
+        asyncio.run(bot_module.go_confirm(cb_update, context))
 
         monitors = fresh_db.get_active_monitors(999)
         assert monitors[0]["min_seats"] == 2
@@ -416,9 +430,9 @@ class TestAdminMutationWriteFailures:
             "car_type": "any", "active": True,
         })
         monkeypatch.setattr(fresh_db, "_write", lambda data: False)
-        update, q = _make_callback_update(uid=999, data=f"mgr_del|{mid}")
+        update, q = _make_callback_update(uid=999, data=f"mgr_delok|{mid}")
 
-        asyncio.run(bot_module.mgr_del(update, _make_context()))
+        asyncio.run(bot_module.mgr_del_confirmed(update, _make_context()))
 
         text = q.edit_message_text.await_args.args[0]
         assert "o'chirildi" not in text

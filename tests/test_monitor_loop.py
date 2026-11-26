@@ -267,6 +267,55 @@ class TestFirstCheckFinishesConfirmation:
         assert app.bot.edit_message_text.await_count == 1  # faqat birinchi tekshiruvda
 
 
+class TestFoundMessageButtons:
+    def _send(self, bot_module, fresh_db, monkeypatch, sequence):
+        monkeypatch.setattr(bot_module, "datetime", _fixed_now(bot_module, 2030, 1, 10, 10, 0))
+        train = {
+            "number": "710Ф", "brand": "Sharq",
+            "departureDate": "10.01.2030 12:00", "arrivalDate": "10.01.2030 18:00",
+            "cars": [{"type": "O'rindiqli", "freeSeats": 5,
+                      "tariffs": [{"classServiceType": "2В", "freeSeats": 5, "tariff": 276820}]}],
+        }
+        state = {"i": 0}
+
+        async def fake_search(client, *a, **kw):
+            trains = [train] if sequence[min(state["i"], len(sequence) - 1)] else []
+            state["i"] += 1
+            return bot_module.SearchResult(True, trains, "")
+
+        async def fake_get_client():
+            return object()
+
+        mon = dict(MON, date="2030-01-10")
+        mid = fresh_db.save_monitor(100, mon)
+
+        async def fake_sleep(_):
+            if state["i"] >= len(sequence) + 1:
+                fresh_db.deactivate(mid)
+
+        monkeypatch.setattr(bot_module, "_shared_search", fake_search)
+        monkeypatch.setattr(bot_module, "_get_railway_client", fake_get_client)
+        monkeypatch.setattr(bot_module.asyncio, "sleep", fake_sleep)
+        app = MagicMock()
+        app.bot.send_message = AsyncMock()
+        asyncio.run(bot_module._monitor_loop(100, mid, dict(mon, id=mid), app))
+        return app.bot.send_message.await_args_list, mid
+
+    def test_first_listing_has_buy_button_only(self, bot_module, fresh_db, monkeypatch):
+        calls, mid = self._send(bot_module, fresh_db, monkeypatch, [True, True])
+        markup = calls[0].kwargs["reply_markup"]
+        datas = [b.callback_data for row in markup.inline_keyboard for b in row]
+        urls = [b.url for row in markup.inline_keyboard for b in row]
+        assert "https://eticket.railway.uz" in urls
+        assert not any(d and d.startswith("rep|") for d in datas)  # monitor davom etadi
+
+    def test_new_find_has_repeat_button(self, bot_module, fresh_db, monkeypatch):
+        calls, mid = self._send(bot_module, fresh_db, monkeypatch, [False, True])
+        markup = calls[-1].kwargs["reply_markup"]
+        datas = [b.callback_data for row in markup.inline_keyboard for b in row]
+        assert f"rep|{mid}" in datas
+
+
 class TestAvailabilityLifecycle:
     """P0: 'reappearing ticket' snapshot modeli. Eski kumulyativ
     (`seen |= fingerprints`) usul g'oyib bo'lib qaytgan joyni abadiy

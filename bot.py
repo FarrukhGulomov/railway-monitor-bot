@@ -60,6 +60,7 @@ for _noisy in ("httpx", "httpcore"):
 ) = range(7)
 
 EDIT_MENU, EDIT_FIELD, EDIT_VALUE = range(7, 10)
+WAIT_CONFIRM = 10
 
 # ─── Konstantalar ───────────────────────────────────────────────────────────────
 STATIONS = {
@@ -463,7 +464,7 @@ def acquire_lock():
 
 
 # ─── Kalendar ───────────────────────────────────────────────────────────────────
-def _calendar_keyboard(year: int, month: int) -> InlineKeyboardMarkup:
+def _calendar_keyboard(year: int, month: int, nav: bool = True) -> InlineKeyboardMarkup:
     now = datetime.now().date()
     month_names = ["","Yanvar","Fevral","Mart","Aprel","May","Iyun",
                    "Iyul","Avgust","Sentabr","Oktabr","Noyabr","Dekabr"]
@@ -488,10 +489,51 @@ def _calendar_keyboard(year: int, month: int) -> InlineKeyboardMarkup:
                     label = f"[{day}]" if date == now else str(day)
                     row.append(InlineKeyboardButton(label, callback_data=f"cal_pick|{year}-{month:02d}-{day:02d}"))
         rows.append(row)
+    if nav:
+        rows.append(_nav_row("date"))
     return InlineKeyboardMarkup(rows)
 
 
 # ─── Yordamchi ──────────────────────────────────────────────────────────────────
+WEEKDAYS_UZ = ["Du", "Se", "Ch", "Pa", "Ju", "Sh", "Ya"]
+
+
+def _fmt_date_wd(iso: str) -> str:
+    """'2026-11-30' -> '30.11.2026 (Du)' — butun botda yagona sana ko'rinishi."""
+    try:
+        d = datetime.strptime(iso, "%Y-%m-%d")
+        return f"{d.strftime('%d.%m.%Y')} ({WEEKDAYS_UZ[d.weekday()]})"
+    except (TypeError, ValueError):
+        return iso or "—"
+
+
+MIN_PRICE = 10_000
+
+
+def _parse_price(text: str):
+    """Narx matnini son qilib qaytaradi: (qiymat, xato_matni). '150 000',
+    '150,000', '150.000' va '150000' bir xil qabul qilinadi."""
+    cleaned = "".join(ch for ch in (text or "") if ch not in " ,.'")
+    if not cleaned.isdigit():
+        return None, "❌ Faqat raqam kiriting (masalan: 250000)."
+    value = int(cleaned)
+    if value < MIN_PRICE:
+        return None, f"❌ Kamida {MIN_PRICE:,} so'm."
+    return value, None
+
+
+def _parse_time_range(text: str):
+    """'18:00-20:00' -> ('18:00','20:00') yoki None."""
+    try:
+        t1, t2 = (text or "").split("-")
+        t1, t2 = t1.strip(), t2.strip()
+        datetime.strptime(t1, "%H:%M")
+        datetime.strptime(t2, "%H:%M")
+        return t1, t2
+    except Exception:
+        return None
+
+
 def _station_keyboard(prefix: str, exclude: str = "") -> InlineKeyboardMarkup:
     keys = [k for k in STATIONS if k != exclude]
     rows = []
@@ -500,7 +542,154 @@ def _station_keyboard(prefix: str, exclude: str = "") -> InlineKeyboardMarkup:
         if i + 1 < len(keys):
             row.append(InlineKeyboardButton(keys[i+1], callback_data=f"{prefix}|{keys[i+1]}"))
         rows.append(row)
+    rows.append(_nav_row("from" if prefix == "from" else "to"))
     return InlineKeyboardMarkup(rows)
+
+
+# ─── /monitor bosqichlari (Orqaga / Bekor qilish bilan) ──────────────────────────
+STEPS = ["from", "to", "date", "car", "time", "price", "seats", "confirm"]
+STEP_STATE = {
+    "from": WAIT_FROM, "to": WAIT_TO, "date": WAIT_DATE, "car": WAIT_CAR_TYPE,
+    "time": WAIT_TIME_RANGE, "price": WAIT_MAX_PRICE, "seats": WAIT_MIN_SEATS,
+    "confirm": WAIT_CONFIRM,
+}
+
+
+def _nav_row(step: str) -> list:
+    """Har bosqich ostidagi navigatsiya: birinchi bosqichda faqat Bekor."""
+    row = []
+    if step != "from":
+        row.append(InlineKeyboardButton("◀️ Orqaga", callback_data="nav|back"))
+    row.append(InlineKeyboardButton("✖️ Bekor", callback_data="nav|cancel"))
+    return row
+
+
+def _with_nav(rows: list, step: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(rows + [_nav_row(step)])
+
+
+def _car_keyboard(prefix: str, with_nav_step: Optional[str] = None) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("🪑 Platskart", callback_data=f"{prefix}|platskar"),
+         InlineKeyboardButton("🛏 Kupe", callback_data=f"{prefix}|coupe")],
+        [InlineKeyboardButton("💺 SV", callback_data=f"{prefix}|sv"),
+         InlineKeyboardButton("🚄 Afrosiyob", callback_data=f"{prefix}|afrosiyob")],
+        [InlineKeyboardButton("🚅 Sharq", callback_data=f"{prefix}|sharq"),
+         InlineKeyboardButton("🚆 J. Manguberdi", callback_data=f"{prefix}|manguberdi")],
+        [InlineKeyboardButton("🔀 Barchasi", callback_data=f"{prefix}|any")],
+    ]
+    return _with_nav(rows, with_nav_step) if with_nav_step else InlineKeyboardMarkup(rows)
+
+
+PRICE_PRESETS = [200_000, 300_000, 500_000, 1_000_000]
+
+
+def _price_keyboard() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(f"{PRICE_PRESETS[0]:,}".replace(",", " "), callback_data=f"price|{PRICE_PRESETS[0]}"),
+         InlineKeyboardButton(f"{PRICE_PRESETS[1]:,}".replace(",", " "), callback_data=f"price|{PRICE_PRESETS[1]}")],
+        [InlineKeyboardButton(f"{PRICE_PRESETS[2]:,}".replace(",", " "), callback_data=f"price|{PRICE_PRESETS[2]}"),
+         InlineKeyboardButton(f"{PRICE_PRESETS[3]:,}".replace(",", " "), callback_data=f"price|{PRICE_PRESETS[3]}")],
+        [InlineKeyboardButton("♾ Cheksiz", callback_data="price|any"),
+         InlineKeyboardButton("✏️ Boshqa summa", callback_data="price|custom")],
+    ]
+    return _with_nav(rows, "price")
+
+
+def _seats_keyboard() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(str(n), callback_data=f"seats|{n}") for n in (1, 2, 3, 4)],
+        [InlineKeyboardButton("✏️ Boshqa son", callback_data="seats|custom")],
+    ]
+    return _with_nav(rows, "seats")
+
+
+def _time_keyboard(prefix: str, custom: bool, with_nav_step: Optional[str]) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("🕐 Istalgan vaqt",         callback_data=f"{prefix}|any")],
+        [InlineKeyboardButton("🌅 Ertalab 06:00–12:00",   callback_data=f"{prefix}|morning")],
+        [InlineKeyboardButton("☀️ Kunduz 12:00–18:00",    callback_data=f"{prefix}|day")],
+        [InlineKeyboardButton("🌆 Kechqurun 18:00–00:00", callback_data=f"{prefix}|evening")],
+        [InlineKeyboardButton("🌙 Tunda 00:00–06:00",     callback_data=f"{prefix}|night")],
+    ]
+    if custom:
+        rows.append([InlineKeyboardButton("✏️ O'zim kiritaman", callback_data=f"{prefix}|custom")])
+    return _with_nav(rows, with_nav_step) if with_nav_step else InlineKeyboardMarkup(rows)
+
+
+def _price_label(ud: dict) -> str:
+    return f"{ud['max_price']:,} so'm" if ud.get("max_price") else "Cheksiz"
+
+
+def _step_view(step: str, ud: dict):
+    """Bosqichning (matn, klaviatura) ko'rinishi — ham oldinga, ham 'Orqaga'
+    bosilganda bir xil ishlatiladi."""
+    if step == "from":
+        return "🚉 *Qayerdan* ketasiz?", _station_keyboard("from")
+    if step == "to":
+        return (
+            f"✅ *Qayerdan:* {ud.get('from_name', '')}\n\n🚉 *Qayerga* ketasiz?",
+            _station_keyboard("to", exclude=ud.get("from_name", "")),
+        )
+    if step == "date":
+        now = datetime.now()
+        return (
+            f"✅ *Qayerdan:* {ud.get('from_name', '')}\n"
+            f"✅ *Qayerga:* {ud.get('to_name', '')}\n\n📅 *Sana* tanlang:",
+            _calendar_keyboard(now.year, now.month),
+        )
+    if step == "car":
+        return (
+            f"✅ *Sana:* {_fmt_date_wd(ud.get('date'))}\n\n🚂 *Vagon turi* tanlang:",
+            _car_keyboard("car", "car"),
+        )
+    if step == "time":
+        return (
+            f"✅ *Vagon:* {CAR_TYPES.get(ud.get('car_type'), '')}\n\n⏰ *Vaqt oralig'i* tanlang:",
+            _time_keyboard("time", custom=True, with_nav_step="time"),
+        )
+    if step == "price":
+        return (
+            f"✅ *Vaqt:* {ud.get('time_label', '🕐 Istalgan vaqt')}\n\n"
+            "💰 *Maksimal narx*ni tanlang yoki o'zingiz yozing (masalan `250000`):",
+            _price_keyboard(),
+        )
+    if step == "seats":
+        return (
+            f"✅ *Narx:* {_price_label(ud)}\n\n"
+            "🎟 *Nechta joy kerak?*\n"
+            "Masalan, 2 kishi birga ketsangiz — `2`. Shuncha (yoki ko'proq) joy "
+            "bitta poyezd/sinfda chiqqandagina xabar beraman.",
+            _seats_keyboard(),
+        )
+    # confirm
+    return (
+        "📝 *Tekshirib oling:*\n\n"
+        f"🚉 {ud.get('from_name', '')} → {ud.get('to_name', '')}\n"
+        f"📅 {_fmt_date_wd(ud.get('date'))}\n"
+        f"🚂 {CAR_TYPES.get(ud.get('car_type'), '')}\n"
+        f"⏰ {ud.get('time_label', '🕐 Istalgan vaqt')}\n"
+        f"💰 Maks: {_price_label(ud)}\n"
+        f"🎟 Kamida: {ud.get('min_seats', 1)} ta joy",
+        InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Boshlash", callback_data="go|start")],
+            [InlineKeyboardButton("🔄 Qaytadan", callback_data="go|restart"),
+             InlineKeyboardButton("✖️ Bekor", callback_data="nav|cancel")],
+        ]),
+    )
+
+
+async def _show_step(update: Update, context: ContextTypes.DEFAULT_TYPE, step: str):
+    """Bosqichni ko'rsatadi (tugma bosilgan bo'lsa xabarni tahrirlaydi,
+    matn kiritilgan bo'lsa yangi xabar yuboradi) va suhbat holatini qaytaradi."""
+    context.user_data["_step"] = step
+    text, markup = _step_view(step, context.user_data)
+    q = update.callback_query
+    if q:
+        await q.edit_message_text(text, reply_markup=markup, parse_mode="Markdown")
+    else:
+        await update.effective_message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
+    return STEP_STATE[step]
 
 
 def _monitor_summary(m: dict) -> str:
@@ -511,7 +700,7 @@ def _monitor_summary(m: dict) -> str:
     return (
         f"🆔 `{m['id']}`\n"
         f"  🚉 {m['from_name']} → {m['to_name']}\n"
-        f"  📅 {m['date']} | ⏰ {m.get('time_from','00:00')}–{m.get('time_to','23:59')}\n"
+        f"  📅 {_fmt_date_wd(m['date'])} | ⏰ {m.get('time_from','00:00')}–{m.get('time_to','23:59')}\n"
         f"  🚂 {CAR_TYPES.get(m.get('car_type','any'), m.get('car_type',''))}\n"
         f"{seats_line}"
         f"  💰 {price} so'm | 🔄 {checks} tekshirildi"
@@ -943,12 +1132,7 @@ async def monitor_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ConversationHandler.END
     context.user_data.clear()
-    await update.message.reply_text(
-        "🚉 *Qayerdan* ketasiz?",
-        reply_markup=_station_keyboard("from"),
-        parse_mode="Markdown",
-    )
-    return WAIT_FROM
+    return await _show_step(update, context, "from")
 
 
 @restricted
@@ -958,12 +1142,7 @@ async def got_from(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _, name = q.data.split("|", 1)
     context.user_data["from_name"] = name
     context.user_data["from_code"] = STATIONS[name]
-    await q.edit_message_text(
-        f"✅ *Qayerdan:* {name}\n\n🚉 *Qayerga* ketasiz?",
-        reply_markup=_station_keyboard("to", exclude=name),
-        parse_mode="Markdown",
-    )
-    return WAIT_TO
+    return await _show_step(update, context, "to")
 
 
 @restricted
@@ -973,14 +1152,7 @@ async def got_to(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _, name = q.data.split("|", 1)
     context.user_data["to_name"] = name
     context.user_data["to_code"] = STATIONS[name]
-    now = datetime.now()
-    await q.edit_message_text(
-        f"✅ *Qayerdan:* {context.user_data['from_name']}\n"
-        f"✅ *Qayerga:* {name}\n\n📅 *Sana* tanlang:",
-        reply_markup=_calendar_keyboard(now.year, now.month),
-        parse_mode="Markdown",
-    )
-    return WAIT_DATE
+    return await _show_step(update, context, "date")
 
 
 @restricted
@@ -995,7 +1167,9 @@ async def cal_navigate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         month += 1
         if month > 12: month, year = 1, year + 1
-    await q.edit_message_reply_markup(reply_markup=_calendar_keyboard(year, month))
+    # Tahrirlash rejimida "Orqaga/Bekor" qatori yo'q (u faqat /monitor oqimida)
+    in_edit = context.user_data.get("edit_field") == "date"
+    await q.edit_message_reply_markup(reply_markup=_calendar_keyboard(year, month, nav=not in_edit))
     return WAIT_DATE
 
 
@@ -1005,20 +1179,7 @@ async def cal_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     _, date_str = q.data.split("|", 1)
     context.user_data["date"] = date_str
-    await q.edit_message_text(
-        f"✅ *Sana:* {date_str}\n\n🚂 *Vagon turi* tanlang:",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🪑 Platskart", callback_data="car|platskar"),
-             InlineKeyboardButton("🛏 Kupe", callback_data="car|coupe")],
-            [InlineKeyboardButton("💺 SV", callback_data="car|sv"),
-             InlineKeyboardButton("🚄 Afrosiyob", callback_data="car|afrosiyob")],
-            [InlineKeyboardButton("🚅 Sharq", callback_data="car|sharq"),
-             InlineKeyboardButton("🚆 J. Manguberdi", callback_data="car|manguberdi")],
-            [InlineKeyboardButton("🔀 Barchasi", callback_data="car|any")],
-        ]),
-        parse_mode="Markdown",
-    )
-    return WAIT_CAR_TYPE
+    return await _show_step(update, context, "car")
 
 
 @restricted
@@ -1027,19 +1188,7 @@ async def got_car_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     _, car = q.data.split("|", 1)
     context.user_data["car_type"] = car
-    await q.edit_message_text(
-        f"✅ *Vagon:* {CAR_TYPES[car]}\n\n⏰ *Vaqt oralig'i* tanlang:",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🕐 Istalgan vaqt",       callback_data="time|any")],
-            [InlineKeyboardButton("🌅 Ertalab 06:00–12:00", callback_data="time|morning")],
-            [InlineKeyboardButton("☀️ Kunduz 12:00–18:00",  callback_data="time|day")],
-            [InlineKeyboardButton("🌆 Kechqurun 18:00–00:00", callback_data="time|evening")],
-            [InlineKeyboardButton("🌙 Tunda 00:00–06:00",   callback_data="time|night")],
-            [InlineKeyboardButton("✏️ O'zim kiritaman",     callback_data="time|custom")],
-        ]),
-        parse_mode="Markdown",
-    )
-    return WAIT_TIME_RANGE
+    return await _show_step(update, context, "time")
 
 
 @restricted
@@ -1052,36 +1201,27 @@ async def got_time_range(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(
             "✏️ Vaqt oralig'ini kiriting:\nFormat: `HH:MM-HH:MM`\nMasalan: `18:00-20:00`",
             parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([_nav_row("time")]),
         )
         return WAIT_TIME_RANGE
     t_from, t_to, label = TIME_RANGES[trange]
     context.user_data.update(time_from=t_from, time_to=t_to, time_label=label)
-    await q.edit_message_text(
-        f"✅ *Vaqt:* {label}\n\n💰 *Maksimal narx* kiriting\nYoki /skip — cheksiz:",
-        parse_mode="Markdown",
-    )
-    return WAIT_MAX_PRICE
+    context.user_data.pop("time_range", None)
+    return await _show_step(update, context, "price")
 
 
 @restricted
 async def got_custom_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get("time_range") != "custom":
         return WAIT_MAX_PRICE
-    text = update.message.text.strip()
-    try:
-        t1, t2 = text.split("-")
-        datetime.strptime(t1.strip(), "%H:%M")
-        datetime.strptime(t2.strip(), "%H:%M")
-        label = f"✏️ {t1.strip()}–{t2.strip()}"
-        context.user_data.update(time_from=t1.strip(), time_to=t2.strip(), time_label=label)
-    except Exception:
+    parsed = _parse_time_range(update.message.text.strip())
+    if not parsed:
         await update.message.reply_text("❌ Format: `18:00-20:00`", parse_mode="Markdown")
         return WAIT_TIME_RANGE
-    await update.message.reply_text(
-        f"✅ *Vaqt:* {label}\n\n💰 *Maksimal narx* kiriting\nYoki /skip — cheksiz:",
-        parse_mode="Markdown",
-    )
-    return WAIT_MAX_PRICE
+    t1, t2 = parsed
+    context.user_data.update(time_from=t1, time_to=t2, time_label=f"✏️ {t1}–{t2}")
+    context.user_data.pop("time_range", None)
+    return await _show_step(update, context, "price")
 
 
 MAX_SEATS_LIMIT = 20
@@ -1092,23 +1232,28 @@ async def got_max_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     max_price = None
     if text != "/skip":
-        cleaned = text.replace(" ","").replace(",","").replace(".","")
-        if not cleaned.isdigit():
-            await update.message.reply_text("❌ Faqat raqam yoki /skip", parse_mode="Markdown")
-            return WAIT_MAX_PRICE
-        max_price = int(cleaned)
-        if max_price < 10000:
-            await update.message.reply_text("❌ Kamida 10,000 so'm.")
+        max_price, err = _parse_price(text)
+        if err:
+            await update.message.reply_text(err)
             return WAIT_MAX_PRICE
     context.user_data["max_price"] = max_price
-    await update.message.reply_text(
-        "🎟 *Nechta joy kerak?*\n"
-        "Masalan, 2 kishi birga sayohat qilsangiz — `2` deb kiriting.\n"
-        "Shuncha (yoki ko'proq) joy bitta poyezd/sinfda chiqqandagina xabar beraman.\n\n"
-        "Yoki /skip — 1 ta joy yetarli:",
-        parse_mode="Markdown",
-    )
-    return WAIT_MIN_SEATS
+    return await _show_step(update, context, "seats")
+
+
+@restricted
+async def got_price_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    _, value = q.data.split("|", 1)
+    if value == "custom":
+        await q.edit_message_text(
+            "✏️ Maksimal narxni so'mda yozing (masalan: `250000`):",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([_nav_row("price")]),
+        )
+        return WAIT_MAX_PRICE
+    context.user_data["max_price"] = None if value == "any" else int(value)
+    return await _show_step(update, context, "seats")
 
 
 @restricted
@@ -1124,7 +1269,57 @@ async def got_min_seats(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"❌ Ko'pi bilan {MAX_SEATS_LIMIT} ta.")
             return WAIT_MIN_SEATS
     context.user_data["min_seats"] = min_seats
-    await _confirm_and_start(update, context)
+    return await _show_step(update, context, "confirm")
+
+
+@restricted
+async def got_seats_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    _, value = q.data.split("|", 1)
+    if value == "custom":
+        await q.edit_message_text(
+            f"✏️ Nechta joy kerak? 1–{MAX_SEATS_LIMIT} oralig'ida son yozing:",
+            reply_markup=InlineKeyboardMarkup([_nav_row("seats")]),
+        )
+        return WAIT_MIN_SEATS
+    context.user_data["min_seats"] = int(value)
+    return await _show_step(update, context, "confirm")
+
+
+@restricted
+async def nav_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    cur = context.user_data.get("_step", "from")
+    idx = STEPS.index(cur) if cur in STEPS else 0
+    context.user_data.pop("time_range", None)
+    return await _show_step(update, context, STEPS[max(idx - 1, 0)])
+
+
+@restricted
+async def nav_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    context.user_data.clear()
+    await q.edit_message_text("❌ Bekor qilindi.\n\n/monitor — yangi kuzatuv")
+    return ConversationHandler.END
+
+
+@restricted
+async def go_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    _, action = q.data.split("|", 1)
+    if action == "restart":
+        context.user_data.clear()
+        return await _show_step(update, context, "from")
+    # start
+    try:
+        await q.edit_message_reply_markup(reply_markup=None)  # ikki marta bosilmasin
+    except Exception:
+        pass
+    started = await _confirm_and_start(update, context)
     return ConversationHandler.END
 
 
@@ -1155,6 +1350,7 @@ async def _finish_confirm_message(app, mid: str, found_any: bool):
 async def _confirm_and_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     ud = context.user_data
+    msg = update.effective_message
     time_from = ud.get("time_from", "00:00")
     time_to   = ud.get("time_to", "23:59")
     time_label = ud.get("time_label", "🕐 Istalgan vaqt")
@@ -1174,17 +1370,17 @@ async def _confirm_and_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
         # DB yozuvi muvaffaqiyatsiz bo'ldi — foydalanuvchiga yolg'on "boshlandi"
         # demaymiz va monitor task'ini ishga tushirmaymiz (u DB'da yo'q).
         logger.error(f"Monitor saqlanmadi (DB write xato): uid={uid}")
-        await update.message.reply_text(
+        await msg.reply_text(
             "❌ Kuzatuvni saqlab bo'lmadi — serverda vaqtinchalik xatolik.\n"
             "Iltimos, birozdan so'ng /monitor bilan qaytadan urinib ko'ring."
         )
         return
-    price_text = f"{ud['max_price']:,} so'm" if ud.get("max_price") else "Cheksiz"
+    price_text = _price_label(ud)
     min_seats = ud.get("min_seats", 1)
     confirm_text = (
         f"✅ *Kuzatuv boshlandi!*\n\n"
         f"🚉 {ud['from_name']} → {ud['to_name']}\n"
-        f"📅 {_fmt_iso_date(ud['date'])}\n"
+        f"📅 {_fmt_date_wd(ud['date'])}\n"
         f"🚂 {CAR_TYPES.get(ud['car_type'], ud['car_type'])}\n"
         f"⏰ {time_label}\n"
         f"💰 Maks: {price_text}\n"
@@ -1192,7 +1388,7 @@ async def _confirm_and_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f"🆔 `{mid}`\n\n"
         f"{CHECKING_LINE}"
     )
-    sent = await update.message.reply_text(confirm_text, parse_mode="Markdown")
+    sent = await msg.reply_text(confirm_text, parse_mode="Markdown")
     chat_id = getattr(sent, "chat_id", None)
     message_id = getattr(sent, "message_id", None)
     if isinstance(chat_id, int) and isinstance(message_id, int):
@@ -1220,9 +1416,31 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def _monitors_keyboard(monitors: list) -> InlineKeyboardMarkup:
     rows = []
     for m in monitors:
-        label = f"🚉 {m['from_name'].split()[-1]}→{m['to_name'].split()[-1]} | {m['date']} | {CAR_TYPES.get(m.get('car_type','any'),'')}"
+        car = CAR_TYPES.get(m.get('car_type', 'any'), '').split(' ', 1)[-1]
+        d = _fmt_date_wd(m['date'])[:5]  # '30.11'
+        label = f"{m['from_name'].split()[-1]}→{m['to_name'].split()[-1]} · {d} · {car}"
         rows.append([InlineKeyboardButton(label, callback_data=f"mgr_show|{m['id']}")])
     return InlineKeyboardMarkup(rows)
+
+
+def _card_markup(mid: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🗑 O'chirish", callback_data=f"mgr_del|{mid}"),
+         InlineKeyboardButton("✏️ Tahrirlash", callback_data=f"mgr_edit|{mid}")],
+        [InlineKeyboardButton("◀️ Orqaga", callback_data="mgr_back")],
+    ])
+
+
+def _updated_card(uid: int, mid: str, headline: str):
+    """Tahrirlashdan keyin foydalanuvchini kuzatuv kartasiga qaytaradi
+    (buyruqni qayta yozdirmasdan). Topilmasa — faqat headline."""
+    m = next((x for x in db.get_active_monitors(uid) if x["id"] == mid), None)
+    if not m:
+        return headline, None
+    return (
+        f"{headline}\n\n📋 *Kuzatuv ma'lumotlari:*\n\n{_monitor_summary(m)}",
+        _card_markup(mid),
+    )
 
 
 @restricted
@@ -1241,16 +1459,28 @@ async def mgr_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📋 *Kuzatuv ma'lumotlari:*\n\n{_monitor_summary(m)}\n\n"
         "Nima qilmoqchisiz?",
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🗑 O'chirish", callback_data=f"mgr_del|{mid}"),
-             InlineKeyboardButton("✏️ Tahrirlash", callback_data=f"mgr_edit|{mid}")],
-            [InlineKeyboardButton("◀️ Orqaga", callback_data="mgr_back")],
-        ]),
+        reply_markup=_card_markup(mid),
     )
 
 
 @restricted
 async def mgr_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """O'chirishdan oldin tasdiq so'raydi (tasodifiy bosish qaytarib bo'lmaydi)."""
+    q = update.callback_query
+    await q.answer()
+    _, mid = q.data.split("|", 1)
+    await q.edit_message_text(
+        f"🗑 `{mid}` kuzatuvini o'chiraman. Ishonchingiz komilmi?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Ha, o'chirish", callback_data=f"mgr_delok|{mid}"),
+             InlineKeyboardButton("◀️ Yo'q", callback_data=f"mgr_show|{mid}")],
+        ]),
+    )
+
+
+@restricted
+async def mgr_del_confirmed(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     _, mid = q.data.split("|", 1)
@@ -1297,31 +1527,17 @@ async def mgr_edit_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
         now = datetime.now()
         await q.edit_message_text(
             "📅 Yangi sana tanlang:",
-            reply_markup=_calendar_keyboard(now.year, now.month),
+            reply_markup=_calendar_keyboard(now.year, now.month, nav=False),
         )
     elif field == "time":
         await q.edit_message_text(
             "⏰ Yangi vaqt oralig'i:",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🕐 Istalgan vaqt",        callback_data="mgr_tv|any")],
-                [InlineKeyboardButton("🌅 Ertalab 06:00–12:00",  callback_data="mgr_tv|morning")],
-                [InlineKeyboardButton("☀️ Kunduz 12:00–18:00",   callback_data="mgr_tv|day")],
-                [InlineKeyboardButton("🌆 Kechqurun 18:00–00:00",callback_data="mgr_tv|evening")],
-                [InlineKeyboardButton("🌙 Tunda 00:00–06:00",    callback_data="mgr_tv|night")],
-            ]),
+            reply_markup=_time_keyboard("mgr_tv", custom=True, with_nav_step=None),
         )
     elif field == "car":
         await q.edit_message_text(
             "🚂 Yangi vagon turi:",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🪑 Platskart", callback_data="mgr_cv|platskar"),
-                 InlineKeyboardButton("🛏 Kupe",      callback_data="mgr_cv|coupe")],
-                [InlineKeyboardButton("💺 SV",        callback_data="mgr_cv|sv"),
-                 InlineKeyboardButton("🚄 Afrosiyob", callback_data="mgr_cv|afrosiyob")],
-                [InlineKeyboardButton("🚅 Sharq",     callback_data="mgr_cv|sharq"),
-                 InlineKeyboardButton("🚆 J. Manguberdi", callback_data="mgr_cv|manguberdi")],
-                [InlineKeyboardButton("🔀 Barchasi",  callback_data="mgr_cv|any")],
-            ]),
+            reply_markup=_car_keyboard("mgr_cv"),
         )
     elif field == "price":
         await q.edit_message_text(
@@ -1338,6 +1554,13 @@ async def mgr_time_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     _, trange = q.data.split("|", 1)
+    if trange == "custom":
+        context.user_data["edit_field"] = "time"
+        await q.edit_message_text(
+            "✏️ Vaqt oralig'ini kiriting:\nFormat: `HH:MM-HH:MM`\nMasalan: `18:00-20:00`",
+            parse_mode="Markdown",
+        )
+        return
     t_from, t_to, label = TIME_RANGES[trange]
     mid = context.user_data.get("edit_mid")
     uid = q.from_user.id
@@ -1349,7 +1572,8 @@ async def mgr_time_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "time_from": t_from, "time_to": t_to, "time_label": label,
     })
     if ok:
-        await q.edit_message_text(f"✅ Vaqt oralig'i yangilandi: {label}\n\n/list — ro'yxatga qaytish")
+        text, markup = _updated_card(uid, mid, f"✅ Vaqt oralig'i yangilandi: {label}")
+        await q.edit_message_text(text, parse_mode="Markdown", reply_markup=markup)
     else:
         await q.edit_message_text("⚠️ Vaqtinchalik xatolik — saqlab bo'lmadi. Qaytadan urinib ko'ring.")
 
@@ -1362,7 +1586,8 @@ async def mgr_car_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mid = context.user_data.get("edit_mid")
     uid = q.from_user.id
     if db.update_monitor_field(uid, mid, "car_type", car):
-        await q.edit_message_text(f"✅ Vagon turi yangilandi: {CAR_TYPES[car]}\n\n/list — ro'yxatga qaytish")
+        text, markup = _updated_card(uid, mid, f"✅ Vagon turi yangilandi: {CAR_TYPES[car]}")
+        await q.edit_message_text(text, parse_mode="Markdown", reply_markup=markup)
     else:
         await q.edit_message_text("⚠️ Vaqtinchalik xatolik — saqlab bo'lmadi. Qaytadan urinib ko'ring.")
 
@@ -1378,7 +1603,8 @@ async def mgr_cal_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if field == "date" and mid:
         uid = q.from_user.id
         if db.update_monitor_field(uid, mid, "date", date_str):
-            await q.edit_message_text(f"✅ Sana yangilandi: {date_str}\n\n/list — ro'yxatga qaytish")
+            text, markup = _updated_card(uid, mid, f"✅ Sana yangilandi: {_fmt_date_wd(date_str)}")
+            await q.edit_message_text(text, parse_mode="Markdown", reply_markup=markup)
         else:
             await q.edit_message_text("⚠️ Vaqtinchalik xatolik — saqlab bo'lmadi. Qaytadan urinib ko'ring.")
     else:
@@ -1405,23 +1631,35 @@ async def mgr_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @restricted
 async def mgr_edit_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Narx yoki joy soni tahrirlash uchun matn kiritish"""
+    """Narx, joy soni yoki vaqt oralig'ini tahrirlash uchun matn kiritish"""
     field = context.user_data.get("edit_field")
-    if field not in ("price", "seats"):
+    if field not in ("price", "seats", "time"):
         return
     text = update.message.text.strip()
     mid = context.user_data.get("edit_mid")
     uid = update.effective_user.id
+    err_save = "⚠️ Vaqtinchalik xatolik — saqlab bo'lmadi. Qaytadan urinib ko'ring."
 
     if field == "price":
-        cleaned = text.replace(" ","").replace(",","")
-        if not cleaned.isdigit():
-            await update.message.reply_text("❌ Faqat raqam yoki /skip")
+        value, err = _parse_price(text)
+        if err:
+            await update.message.reply_text(err + " Yoki /skip — cheksiz.")
             return
-        if not db.update_monitor_field(uid, mid, "max_price", int(cleaned)):
-            await update.message.reply_text("⚠️ Vaqtinchalik xatolik — saqlab bo'lmadi. Qaytadan urinib ko'ring.")
+        if not db.update_monitor_field(uid, mid, "max_price", value):
+            await update.message.reply_text(err_save)
             return
-        await update.message.reply_text(f"✅ Narx yangilandi: {int(cleaned):,} so'm\n\n/list — ro'yxatga qaytish")
+        headline = f"✅ Narx yangilandi: {value:,} so'm"
+    elif field == "time":
+        parsed = _parse_time_range(text)
+        if not parsed:
+            await update.message.reply_text("❌ Format: `18:00-20:00`", parse_mode="Markdown")
+            return
+        t1, t2 = parsed
+        label = f"✏️ {t1}–{t2}"
+        if not db.update_monitor_fields(uid, mid, {"time_from": t1, "time_to": t2, "time_label": label}):
+            await update.message.reply_text(err_save)
+            return
+        headline = f"✅ Vaqt oralig'i yangilandi: {label}"
     else:  # seats
         if not text.isdigit() or int(text) < 1:
             await update.message.reply_text("❌ Faqat musbat butun son yoki /skip")
@@ -1431,12 +1669,14 @@ async def mgr_edit_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"❌ Ko'pi bilan {MAX_SEATS_LIMIT} ta.")
             return
         if not db.update_monitor_field(uid, mid, "min_seats", n):
-            await update.message.reply_text("⚠️ Vaqtinchalik xatolik — saqlab bo'lmadi. Qaytadan urinib ko'ring.")
+            await update.message.reply_text(err_save)
             return
-        await update.message.reply_text(f"✅ Joy soni yangilandi: {n} ta\n\n/list — ro'yxatga qaytish")
+        headline = f"✅ Joy soni yangilandi: {n} ta"
 
     context.user_data.pop("edit_field", None)
     context.user_data.pop("edit_mid", None)
+    card, markup = _updated_card(uid, mid, headline)
+    await update.message.reply_text(card, parse_mode="Markdown", reply_markup=markup)
 
 
 @restricted
@@ -1459,7 +1699,8 @@ async def mgr_edit_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     context.user_data.pop("edit_field", None)
     context.user_data.pop("edit_mid", None)
-    await update.message.reply_text(f"{msg}\n\n/list — ro'yxatga qaytish")
+    card, markup = _updated_card(uid, mid, msg)
+    await update.message.reply_text(card, parse_mode="Markdown", reply_markup=markup)
 
 
 # ─── /stop ──────────────────────────────────────────────────────────────────────
@@ -1477,13 +1718,63 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text("❌ Topilmadi.")
     else:
-        count = db.deactivate_all(uid)
-        if count is None:
-            await update.message.reply_text("⚠️ Vaqtinchalik xatolik — to'xtatib bo'lmadi. Qaytadan urinib ko'ring.")
-        elif count:
-            await update.message.reply_text(f"⏹ {count} ta kuzatuv to'xtatildi.")
-        else:
+        active = db.get_active_monitors(uid)
+        if not active:
             await update.message.reply_text("📭 Faol kuzatuv yo'q.")
+            return
+        await update.message.reply_text(
+            f"⏹ {len(active)} ta faol kuzatuvning HAMMASINI to'xtataman. Ishonchingiz komilmi?",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Ha, hammasini", callback_data="stop_all|yes"),
+                 InlineKeyboardButton("✖️ Yo'q", callback_data="stop_all|no")],
+            ]),
+        )
+
+
+@restricted
+async def stop_all_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    _, answer = q.data.split("|", 1)
+    if answer != "yes":
+        await q.edit_message_text("👌 Kuzatuvlar o'z holicha qoldi.")
+        return
+    count = db.deactivate_all(q.from_user.id)
+    if count is None:
+        await q.edit_message_text("⚠️ Vaqtinchalik xatolik — to'xtatib bo'lmadi. Qaytadan urinib ko'ring.")
+    elif count:
+        await q.edit_message_text(f"⏹ {count} ta kuzatuv to'xtatildi.")
+    else:
+        await q.edit_message_text("📭 Faol kuzatuv yo'q.")
+
+
+@restricted
+async def repeat_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Bilet topilib to'xtagan kuzatuvni bir bosishda qayta ishga tushirish."""
+    q = update.callback_query
+    await q.answer()
+    _, mid = q.data.split("|", 1)
+    uid = q.from_user.id
+    if len(db.get_active_monitors(uid)) >= Config.MAX_MONITORS_PER_USER:
+        await q.answer(f"⚠️ Maksimal {Config.MAX_MONITORS_PER_USER} ta kuzatuv. /list orqali birini o'chiring.", show_alert=True)
+        return
+    src = next((m for m in db.get_user_monitors(uid) if m.get("id") == mid), None)
+    if not src:
+        await q.answer("❌ Kuzatuv topilmadi.", show_alert=True)
+        return
+    fresh = {k: v for k, v in src.items() if k not in ("id", "uid")}
+    fresh.update(active=True, created_at=datetime.now().isoformat(), check_count=0, last_check=None)
+    new_mid = db.save_monitor(uid, fresh)
+    if new_mid is None:
+        await q.answer("⚠️ Vaqtinchalik xatolik — qaytadan urinib ko'ring.", show_alert=True)
+        return
+    try:
+        await q.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await q.message.reply_text(
+        f"🔁 Kuzatuv qayta boshlandi.\n🆔 `{new_mid}`", parse_mode="Markdown")
+    _spawn_monitor(uid, new_mid, {**fresh, "id": new_mid, "uid": uid}, context.application)
 
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1737,11 +2028,18 @@ async def _monitor_loop(uid: int, mid: str, data: dict, app):
                     if not first_run:
                         lines.append(f"\n_Kuzatuv to'xtatildi: {mid}_")
 
-                    for part in _chunk_message(lines):
+                    buttons = [[InlineKeyboardButton("🎫 Bilet sotib olish", url=link)]]
+                    if not first_run:
+                        # Kuzatuv to'xtadi — bir bosishda qayta yoqish imkoni
+                        buttons.append([InlineKeyboardButton(
+                            "🔁 Kuzatishni davom ettirish", callback_data=f"rep|{mid}")])
+                    parts = _chunk_message(lines)
+                    for i, part in enumerate(parts):
                         await app.bot.send_message(
                             uid, part,
                             parse_mode="Markdown",
                             disable_web_page_preview=True,
+                            reply_markup=InlineKeyboardMarkup(buttons) if i == len(parts) - 1 else None,
                         )
                     if not first_run:
                         # Mahsulot qoidasi (ataylab saqlangan): birinchi
@@ -2073,19 +2371,24 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, got_custom_time),
             ],
             WAIT_MAX_PRICE: [
+                CallbackQueryHandler(got_price_button, pattern=r"^price\|"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, got_max_price),
                 CommandHandler("skip", got_max_price),
             ],
             WAIT_MIN_SEATS: [
+                CallbackQueryHandler(got_seats_button, pattern=r"^seats\|"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, got_min_seats),
                 CommandHandler("skip", got_min_seats),
             ],
+            WAIT_CONFIRM: [CallbackQueryHandler(go_confirm, pattern=r"^go\|")],
         },
         fallbacks=[
+            CallbackQueryHandler(nav_back,   pattern=r"^nav\|back$"),
+            CallbackQueryHandler(nav_cancel, pattern=r"^nav\|cancel$"),
             CommandHandler("cancel", cmd_cancel),
             CommandHandler("monitor", monitor_start),  # qayta /monitor — eskisini bekor qilib qayta boshlaydi
         ],
-        conversation_timeout=180,
+        conversation_timeout=600,
     )
 
     app.add_handler(CommandHandler("start",  cmd_start))
@@ -2109,6 +2412,9 @@ def main():
     # /list manager handlers
     app.add_handler(CallbackQueryHandler(mgr_show,       pattern=r"^mgr_show\|"))
     app.add_handler(CallbackQueryHandler(mgr_del,        pattern=r"^mgr_del\|"))
+    app.add_handler(CallbackQueryHandler(mgr_del_confirmed, pattern=r"^mgr_delok\|"))
+    app.add_handler(CallbackQueryHandler(stop_all_cb,    pattern=r"^stop_all\|"))
+    app.add_handler(CallbackQueryHandler(repeat_cb,      pattern=r"^rep\|"))
     app.add_handler(CallbackQueryHandler(mgr_edit,       pattern=r"^mgr_edit\|"))
     app.add_handler(CallbackQueryHandler(mgr_edit_field, pattern=r"^mgr_ef\|"))
     app.add_handler(CallbackQueryHandler(mgr_time_value, pattern=r"^mgr_tv\|"))
