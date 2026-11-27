@@ -108,6 +108,7 @@ class RailwayClient:
         # Bitta marshrut 429 olsa, boshqalari ham shu IP'dan ketayotgani uchun
         # kutadi; interval esa sekin-asta kengayib, muvaffaqiyatda tiklanadi.
         self._cooldown_until = 0.0
+        self._blocked_until_wall = 0.0
         self._consecutive_429 = 0
         self._extra_interval = 0.0
         primary = _configured_base()
@@ -234,13 +235,34 @@ class RailwayClient:
     MAX_COOLDOWN = 120.0
     MAX_EXTRA_INTERVAL = 10.0
 
-    def _on_rate_limited(self, headers) -> float:
+    # Shundan uzun Retry-After yoki sayt "RISK_DENIED" desa — bu tezlik chegarasi
+    # emas, saytning xavf tizimi bloki. Uni TO'LIQ hurmat qilamiz: muddat
+    # tugaguncha saytga umuman so'rov yubormaymiz (aylanib o'tishga urinmaymiz).
+    LONG_BLOCK_SECONDS = 300.0
+
+    def blocked_until(self) -> float:
+        """Uzoq blok tugaydigan vaqt (time.time() epoch), blok bo'lmasa 0."""
+        return self._blocked_until_wall if self._blocked_until_wall > time.time() else 0.0
+
+    def _on_rate_limited(self, headers, body: str = "") -> float:
         """429 kelganda umumiy sovutish muddatini belgilaydi: Retry-After bo'lsa
         shu (<=MAX_COOLDOWN), bo'lmasa 30s dan boshlab ikki baravar oshib boradi."""
         try:
-            wait = float(headers.get("Retry-After"))
+            wait = float(headers.get("Retry-After") or headers.get("retry-after"))
         except (TypeError, ValueError, AttributeError):
             wait = 30.0 * (2 ** min(self._consecutive_429, 2))
+        if "RISK_DENIED" in (body or "") or wait > self.LONG_BLOCK_SECONDS:
+            wait = max(wait, self.LONG_BLOCK_SECONDS)
+            with self._pacing_lock:
+                self._consecutive_429 += 1
+                self._blocked_until_wall = time.time() + wait
+                self._cooldown_until = time.monotonic() + wait
+            metrics.incr("railway_risk_blocks_total")
+            logger.error(
+                f"⛔ Sayt xavf tizimi so'rovlarni blokladi (RISK_DENIED), muddat {wait/3600:.1f} soat. "
+                "Blok tugaguncha so'rov yuborilmaydi."
+            )
+            return wait
         wait = max(1.0, min(wait, self.MAX_COOLDOWN))
         with self._pacing_lock:
             self._consecutive_429 += 1
@@ -285,6 +307,9 @@ class RailwayClient:
         bir vaqtda xavfsiz chaqirish mumkin — ular bir-birining backoff
         kutishini TO'SMAYDI, faqat navbat bilan haqiqiy so'rov yuboradi."""
         start = time.monotonic()
+        if self.blocked_until():
+            # Blok paytida saytga hech narsa yubormaymiz (thread'ni soatlab ushlab ham turmaymiz).
+            return SearchResult(False, [], "risk_blocked")
         result = self._search_trains_impl(from_code, to_code, date)
         result.latency = time.monotonic() - start
         return result
@@ -386,7 +411,9 @@ class RailwayClient:
                         if k.lower().startswith(("retry", "x-ratelimit", "ratelimit", "server", "cf-", "x-cache"))
                     } if hasattr(r.headers, "items") else {}
                     logger.warning(f"429 tafsiloti: headers={rl_headers} body={r.text[:300]!r}")
-                    wait = self._on_rate_limited(r.headers)
+                    wait = self._on_rate_limited(r.headers, r.text or "")
+                    if self.blocked_until():
+                        return SearchResult(False, [], "risk_blocked")
                     if self._consecutive_429 >= 2:
                         # Cheklov sessiyaga bog'liq bo'lishi mumkin — yangi cookie/token bilan urinamiz.
                         logger.warning("Takroriy 429 — session yangilanmoqda")
@@ -470,13 +497,15 @@ class RailwayClient:
         }
         if not payload["depStationCode"] or not payload["arvStationCode"] or not payload["trainNumber"]:
             return None
+        if self.blocked_until():
+            return None
         try:
             self._throttle()
             metrics.incr("railway_requests_total")
             with self._session_lock:
                 r = self._session.post(f"{self.base}{PLACES_PATH}", json=payload, timeout=self.TIMEOUT)
             if r.status_code == 429:
-                self._on_rate_limited(r.headers)
+                self._on_rate_limited(r.headers, r.text or "")
                 return None
             if r.status_code != 200:
                 logger.info(f"Joy tafsiloti: status {r.status_code}")
