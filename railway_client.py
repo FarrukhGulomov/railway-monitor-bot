@@ -171,6 +171,8 @@ class RailwayClient:
                 if not token:
                     token = self._extract_token_from_headers(r)
                 if not token:
+                    token = self._fetch_csrf_token()
+                if not token:
                     token = str(uuid.uuid4())
                     logger.info("XSRF token o'zimiz generatsiya qildik")
 
@@ -183,6 +185,29 @@ class RailwayClient:
 
             except Exception as e:
                 logger.error(f"Session init xato: {e}")
+
+    def _fetch_csrf_token(self) -> str:
+        """Saytning o'z CSRF endpointi (docs/UZRAILPASS_API.md, 1-bo'lim).
+        Javob shakli tasdiqlanmagan — cookie yoki JSON ichidan qidiriladi.
+        _session_lock allaqachon ushlangan holda chaqiriladi."""
+        try:
+            r = self._session.get(f"{self.base}/api/v1/csrf-token", timeout=self.TIMEOUT)
+            logger.info(f"csrf-token status: {r.status_code}")
+            token = self._find_xsrf_token() or self._extract_token_from_headers(r)
+            if token or r.status_code != 200:
+                return token
+            data = r.json()
+            if isinstance(data, dict):
+                inner = data.get("data", data)
+                if isinstance(inner, str):
+                    return inner
+                if isinstance(inner, dict):
+                    for k in ("token", "csrfToken", "xsrfToken", "value"):
+                        if isinstance(inner.get(k), str):
+                            return inner[k]
+        except Exception as e:
+            logger.info(f"csrf-token olinmadi: {e}")
+        return ""
 
     def _find_xsrf_token(self) -> str:
         for name in ("XSRF-TOKEN", "csrf_token", "CSRF-TOKEN", "_csrf", "csrftoken"):
@@ -355,7 +380,19 @@ class RailwayClient:
 
                 if r.status_code == 429:
                     metrics.incr("railway_429_total")
+                    # Cheklov turini aniqlash uchun (IP / sessiya / WAF) javobni ko'rsatamiz.
+                    rl_headers = {
+                        k: v for k, v in dict(r.headers).items()
+                        if k.lower().startswith(("retry", "x-ratelimit", "ratelimit", "server", "cf-", "x-cache"))
+                    } if hasattr(r.headers, "items") else {}
+                    logger.warning(f"429 tafsiloti: headers={rl_headers} body={r.text[:300]!r}")
                     wait = self._on_rate_limited(r.headers)
+                    if self._consecutive_429 >= 2:
+                        # Cheklov sessiyaga bog'liq bo'lishi mumkin — yangi cookie/token bilan urinamiz.
+                        logger.warning("Takroriy 429 — session yangilanmoqda")
+                        with self._session_lock:
+                            self._session.cookies.clear()
+                        self._init_session()
                     logger.warning(
                         f"Rate limit (429) — umumiy sovutish {wait:.0f}s, "
                         f"interval +{self._extra_interval:.0f}s"
