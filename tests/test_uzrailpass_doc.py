@@ -177,3 +177,15 @@ class TestFoundMessageShowsPlaces:
         asyncio.run(bot_module._monitor_loop(100, mid, dict(mon, id=mid), app))
         text = app.bot.send_message.await_args_list[0].args[1]
         assert "🚃 Vagon 03: 11, 12, 13" in text
+
+
+class TestRepeated429RefreshesSession:
+    def test_second_429_resets_session(self, monkeypatch):
+        client = _make_client(monkeypatch, [_FakeResponse(429, text="Too Many")] * 3)
+        inits = []
+        monkeypatch.setattr(RailwayClient, "_init_session", lambda self: inits.append(1))
+        client.search_trains("A", "B", "2030-01-01")
+        assert inits == []                      # birinchi 429 — faqat sovutish
+        client._cooldown_until = 0
+        client.search_trains("A", "B", "2030-01-01")
+        assert inits == [1]                     # ikkinchisida sessiya yangilandi
