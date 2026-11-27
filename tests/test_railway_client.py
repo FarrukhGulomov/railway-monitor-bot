@@ -72,13 +72,13 @@ class TestSearchResultStatus:
         assert result.ok is False
 
     def test_500_exhausts_retries_is_error(self, monkeypatch):
-        # 5xx endi transient deb qayta uriniladi (MAX_RETRIES=3) — uchalasi
-        # ham 500 bo'lsa, retrylar tugagach xato qaytariladi.
+        # Tez 5xx bir marta qayta uriniladi (MAX_RETRIES=2) — ikkalasi ham
+        # 500 bo'lsa xato qaytariladi.
         responses = [_FakeResponse(500, text="server error")] * 3
         client = _make_client(monkeypatch, responses)
         result = client.search_trains("A", "B", "2030-01-01")
         assert result.ok is False
-        assert client._session.calls == 3
+        assert client._session.calls == 2
 
     def test_5xx_retries_then_recovers(self, monkeypatch):
         # Birinchi urinish 503 (transient), ikkinchisi muvaffaqiyatli —
@@ -90,6 +90,35 @@ class TestSearchResultStatus:
         assert result.ok is True
         assert result.trains == [{"number": "7"}]
         assert client._session.calls == 2
+
+    def test_405_refreshes_session_and_recovers(self, monkeypatch):
+        payload = {"data": {"directions": {"forward": {"trains": [{"number": "9"}]}}}}
+        client = _make_client(monkeypatch, [_FakeResponse(405, text="nope"), _FakeResponse(200, json_data=payload)])
+        result = client.search_trains("A", "B", "2030-01-01")
+        assert result.ok is True and result.trains == [{"number": "9"}]
+        assert client._session.calls == 2
+
+    def test_405_twice_is_error_with_clear_code(self, monkeypatch):
+        client = _make_client(monkeypatch, [_FakeResponse(405, text="nope")] * 3)
+        result = client.search_trains("A", "B", "2030-01-01")
+        assert result.ok is False and result.error == "http_405"
+        assert client._session.calls == 2
+
+    def test_slow_5xx_is_not_retried_inside_call(self, monkeypatch):
+        # 504 odatda ~15s'dan keyin keladi: ichida qayta urinmaymiz, sikl o'zi qayta uradi.
+        client = _make_client(monkeypatch, [_FakeResponse(504, text="gateway timeout")] * 3)
+        clock = {"t": 1000.0}
+        monkeypatch.setattr("railway_client.time.monotonic", lambda: clock["t"])
+        real_post = client._session.post
+
+        def slow_post(*a, **kw):
+            clock["t"] += 15.0  # 504 ~15s'dan keyin keladi
+            return real_post(*a, **kw)
+
+        client._session.post = slow_post
+        result = client.search_trains("A", "B", "2030-01-01")
+        assert result.ok is False and result.error == "http_504"
+        assert client._session.calls == 1
 
     def test_malformed_json_is_error_not_empty(self, monkeypatch):
         # Status 200 lekin javob tanasi buzilgan JSON — bu ham "reys yo'q" emas.

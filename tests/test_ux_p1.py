@@ -193,3 +193,27 @@ class TestRepeatAfterFound:
         upd, q = _make_callback_update(uid=999, data=f"rep|{mid}")
         asyncio.run(bot_module.repeat_cb(upd, _make_context()))
         assert len(fresh_db.get_active_monitors(999)) == 1
+
+
+class TestSiteErrorHandling:
+    def test_error_sleep_stays_near_interval(self, bot_module):
+        f = bot_module._error_sleep
+        assert f(5, 1) == 5 and f(5, 5) == 5
+        assert f(5, 6) == 10 and f(5, 12) == 15
+        assert f(5, 100) == 15  # 3x dan oshmaydi
+
+    def test_first_failed_check_edits_confirmation(self, bot_module):
+        bot_module._confirm_messages["e1"] = (1, 2, f"x\n{bot_module.CHECKING_LINE}")
+        app = MagicMock(); app.bot.edit_message_text = AsyncMock()
+        asyncio.run(bot_module._mark_confirm_site_down(app, "e1"))
+        asyncio.run(bot_module._mark_confirm_site_down(app, "e1"))  # ikkinchi marta — qayta tahrirlamaydi
+        assert app.bot.edit_message_text.await_count == 1
+        assert "javob bermayapti" in app.bot.edit_message_text.await_args.args[0]
+        assert "e1" in bot_module._confirm_messages  # tiklanganda yakunlash uchun saqlanadi
+
+    def test_recovery_replaces_site_down_line(self, bot_module):
+        bot_module._confirm_messages["e2"] = (1, 2, f"x\n{bot_module.SITE_DOWN_LINE}")
+        app = MagicMock(); app.bot.edit_message_text = AsyncMock()
+        asyncio.run(bot_module._finish_confirm_message(app, "e2", False))
+        text = app.bot.edit_message_text.await_args.args[0]
+        assert "javob bermayapti" not in text and "hozircha mos bilet yo'q" in text
