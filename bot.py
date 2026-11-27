@@ -669,6 +669,28 @@ def _time_keyboard(prefix: str, custom: bool, with_nav_step: Optional[str]) -> I
     return _with_nav(rows, with_nav_step) if with_nav_step else InlineKeyboardMarkup(rows)
 
 
+SALES_WINDOW_DAYS = 60       # oferta: sotuv odatda 60 kun oldin ochiladi
+SALES_OPEN_HOUR = "10:00"    # mahalliy vaqt
+
+
+def _sales_note(iso_date: str) -> str:
+    """Sana sotuv oynasidan uzoq bo'lsa — foydalanuvchiga ogohlantirish matni
+    (bo'sh qator — kerak emas). Kuzatuv baribir yaratiladi: aynan sotuv
+    ochilishini kutish ham mumkin."""
+    try:
+        d = datetime.strptime(iso_date, "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return ""
+    if (d - datetime.now().date()).days <= SALES_WINDOW_DAYS:
+        return ""
+    opens = d - timedelta(days=SALES_WINDOW_DAYS)
+    return (
+        "\n\nℹ️ Bu sana uchun sotuv hali ochilmagan bo'lishi mumkin "
+        f"(odatda {SALES_WINDOW_DAYS} kun oldin, ~{opens.strftime('%d.%m.%Y')} {SALES_OPEN_HOUR} da ochiladi). "
+        "Bot ochilishi bilan xabar beradi."
+    )
+
+
 def _price_label(ud: dict) -> str:
     return f"{ud['max_price']:,} so'm" if ud.get("max_price") else "Cheksiz"
 
@@ -687,7 +709,8 @@ def _step_view(step: str, ud: dict):
         now = datetime.now()
         return (
             f"✅ *Qayerdan:* {ud.get('from_name', '')}\n"
-            f"✅ *Qayerga:* {ud.get('to_name', '')}\n\n📅 *Sana* tanlang:",
+            f"✅ *Qayerga:* {ud.get('to_name', '')}\n\n📅 *Sana* tanlang:\n"
+            f"_Sotuv odatda {SALES_WINDOW_DAYS} kun oldin ochiladi._",
             _calendar_keyboard(now.year, now.month),
         )
     if step == "brand":
@@ -727,7 +750,7 @@ def _step_view(step: str, ud: dict):
         f"🚂 {_filter_label(ud)}\n"
         f"⏰ {ud.get('time_label', '🕐 Istalgan vaqt')}\n"
         f"💰 Maks: {_price_label(ud)}\n"
-        f"🎟 Kamida: {ud.get('min_seats', 1)} ta joy",
+        f"🎟 Kamida: {ud.get('min_seats', 1)} ta joy" + _sales_note(ud.get("date")),
         InlineKeyboardMarkup([
             [InlineKeyboardButton("✅ Boshlash", callback_data="go|start")],
             [InlineKeyboardButton("🔄 Qaytadan", callback_data="go|restart"),
@@ -1325,7 +1348,8 @@ async def got_custom_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await _show_step(update, context, "price")
 
 
-MAX_SEATS_LIMIT = 20
+# Sayt qoidasi (oferta): bitta buyurtmada ko'pi bilan 4 yo'lovchi/joy.
+MAX_SEATS_LIMIT = 4
 
 
 @restricted
@@ -1971,6 +1995,22 @@ MAX_CONSECUTIVE_ERRORS_BEFORE_NOTICE = 5
 MAX_ERROR_BACKOFF = 300  # soniya — API xatosi davom etsa kutish shu chegaradan oshmaydi
 
 
+class _SkipCycle(Exception):
+    """Monitor siklini qidiruvsiz o'tkazib yuborish uchun ichki signal."""
+
+
+TECH_BREAK = ((2, 30), (3, 0))  # oferta: 02:30–03:00 (mahalliy vaqt)
+
+
+def _tech_break_wait(now: datetime) -> float:
+    """Texnik tanaffus ichida bo'lsak — tugashigacha qolgan soniya (0 bo'lsa tanaffus emas)."""
+    start = now.replace(hour=TECH_BREAK[0][0], minute=TECH_BREAK[0][1], second=0, microsecond=0)
+    end = now.replace(hour=TECH_BREAK[1][0], minute=TECH_BREAK[1][1], second=0, microsecond=0)
+    if start <= now < end:
+        return (end - now).total_seconds()
+    return 0.0
+
+
 def _error_sleep(check_interval: float, consecutive_errors: int) -> float:
     """Sayt xato bersa ham ritm deyarli o'zgarmaydi: dastlabki 5 ta xatoda —
     oddiy CHECK_INTERVAL, keyin ko'pi bilan 3 baravargacha (sayt uzoq ishlamasa
@@ -2100,6 +2140,14 @@ async def _monitor_loop(uid: int, mid: str, data: dict, app):
                     return
             except ValueError:
                 pass
+
+            # 2.5) Sayt texnik tanaffusi (02:30–03:00): so'rov yubormaymiz va
+            # xato sanamaymiz — bu "bilet yo'q" ham, "sayt buzildi" ham emas.
+            wait_break = _tech_break_wait(datetime.now())
+            if wait_break > 0:
+                logger.info(f"mid={mid}: texnik tanaffus (02:30–03:00), {wait_break:.0f}s kutiladi")
+                sleep_duration = min(wait_break, 60)
+                raise _SkipCycle()
 
             # 3) Qidiruv — umumiy koordinator orqali (bir xil marshrut+sanani
             # so'rayotgan boshqa monitorlar bilan natija bo'lishiladi).
@@ -2240,6 +2288,8 @@ async def _monitor_loop(uid: int, mid: str, data: dict, app):
 
         except asyncio.CancelledError:
             raise
+        except _SkipCycle:
+            pass  # texnik tanaffus: bu siklda so'rov yo'q, holat o'zgarmaydi
         except Exception as e:
             logger.error(f"Monitor xato mid={mid}: {e}")
             first_run = False

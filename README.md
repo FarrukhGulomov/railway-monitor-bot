@@ -257,3 +257,11 @@ Har bir push/PR da GitHub Actions CI testlarni avtomatik ishga tushiradi.
 ## Litsenziya
 
 MIT — shaxsiy foydalanish uchun erkin.
+
+
+## Sayt qoidalari (oferta asosida)
+
+- Bitta buyurtmada ko'pi bilan **4** yo'lovchi — shuning uchun "joy soni" 1–4.
+- Sotuv odatda **60 kun oldin 10:00** da ochiladi — uzoq sana tanlansa, bot ogohlantiradi va sotuv ochilishini kutadi.
+- Sayt texnik tanaffusi **02:30–03:00** — bu vaqtda bot so'rov yubormaydi va xato sanamaydi.
+- Sayt domeni ko'chgan bo'lishi mumkin (`eticket.uzrailpass.uz`): klient redirektni kuzatadi, 405 davom etsa zaxira manzilga o'tadi; `RAILWAY_BASE_URL` bilan qo'lda ham belgilanadi.

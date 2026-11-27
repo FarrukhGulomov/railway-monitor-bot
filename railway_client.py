@@ -36,7 +36,12 @@ from metrics import metrics
 logger = logging.getLogger("railway_client")
 
 BASE = "https://eticket.railway.uz"
-SEARCH_URL = f"{BASE}/api/v3/handbook/trains/list"
+# Sayt (hujjatlarga ko'ra) eticket.uzrailpass.uz domeniga ko'chgan bo'lishi
+# mumkin. Aniq API kontrakti tasdiqlanmagani uchun klient ikkala manzilni
+# biladi: redirektni kuzatadi va 405 davom etsa zaxira manzilga o'tadi.
+FALLBACK_BASES = ["https://eticket.uzrailpass.uz"]
+SEARCH_PATH = "/api/v3/handbook/trains/list"
+SEARCH_URL = f"{BASE}{SEARCH_PATH}"
 
 HEADERS = {
     "Accept": "application/json",
@@ -56,6 +61,26 @@ class SearchResult:
     trains: list = field(default_factory=list)
     error: str = ""
     latency: float = 0.0  # so'rov boshlanishidan natija qaytishigacha (soniya) — diagnostika uchun
+
+
+def _origin(url: str) -> str:
+    """'https://host/path?x' -> 'https://host' (bo'sh/noto'g'ri bo'lsa '')."""
+    from urllib.parse import urlsplit
+    try:
+        parts = urlsplit(str(url or ""))
+    except ValueError:
+        return ""
+    if parts.scheme in ("http", "https") and parts.netloc:
+        return f"{parts.scheme}://{parts.netloc}"
+    return ""
+
+
+def _configured_base() -> str:
+    try:
+        from config import Config
+        return (Config.RAILWAY_BASE_URL or BASE).rstrip("/")
+    except Exception:
+        return BASE
 
 
 def _default_min_interval() -> float:
@@ -78,6 +103,10 @@ class RailwayClient:
         self._session = cffi_requests.Session(impersonate="chrome124")
         self._session.headers.update(HEADERS)
         self._last_request = 0.0
+        primary = _configured_base()
+        self._bases = [primary] + [b for b in [BASE] + FALLBACK_BASES if b != primary]
+        self._base_idx = 0
+        self._apply_base_headers()
         self.MIN_INTERVAL = min_interval if min_interval is not None else _default_min_interval()
 
         # Faqat pasing uchun — "keyingi ruxsat etilgan vaqt"ni himoya qiladi,
@@ -95,11 +124,41 @@ class RailwayClient:
 
         self._init_session()
 
+    @property
+    def base(self) -> str:
+        return self._bases[self._base_idx]
+
+    def _apply_base_headers(self):
+        self._session.headers.update({"Origin": self.base, "Referer": f"{self.base}/uz/home"})
+
+    def _adopt_base(self, origin: str):
+        """Sayt boshqa domenga yo'naltirgan bo'lsa, shu manzilga o'tamiz."""
+        if origin not in self._bases:
+            self._bases.append(origin)
+        self._base_idx = self._bases.index(origin)
+        self._apply_base_headers()
+
+    def _rotate_base(self):
+        """405 davom etsa — zaxira manzilga o'tamiz (domen ko'chgan bo'lishi mumkin)."""
+        if len(self._bases) < 2:
+            return
+        old = self.base
+        self._base_idx = (self._base_idx + 1) % len(self._bases)
+        self._apply_base_headers()
+        with self._session_lock:
+            self._session.cookies.clear()
+        metrics.incr("railway_base_rotations_total")
+        logger.warning(f"405 davom etdi — manzil almashtirildi: {old} → {self.base}")
+
     def _init_session(self):
         with self._session_lock:
             try:
-                r = self._session.get(f"{BASE}/uz/home", timeout=self.TIMEOUT)
-                logger.info(f"Session init status: {r.status_code}")
+                r = self._session.get(f"{self.base}/uz/home", timeout=self.TIMEOUT)
+                final = _origin(getattr(r, "url", ""))
+                if final and final != self.base:
+                    logger.warning(f"Sayt yo'naltirdi: {self.base} → {final} (yangi manzilga o'tildi)")
+                    self._adopt_base(final)
+                logger.info(f"Session init status: {r.status_code} ({self.base})")
 
                 token = self._find_xsrf_token()
                 if not token:
@@ -109,7 +168,8 @@ class RailwayClient:
                     logger.info("XSRF token o'zimiz generatsiya qildik")
 
                 self._session.headers["X-Xsrf-Token"] = token
-                self._session.cookies.set("XSRF-TOKEN", token, domain="eticket.railway.uz")
+                from urllib.parse import urlsplit
+                self._session.cookies.set("XSRF-TOKEN", token, domain=urlsplit(self.base).netloc)
                 # MUHIM: tokenning o'zini (hatto qisman ham) hech qachon log qilmaymiz —
                 # bu himoya tokeni, log fayli/bot.log orqali oshkor bo'lmasligi kerak.
                 logger.info("✅ XSRF token o'rnatildi")
@@ -194,7 +254,7 @@ class RailwayClient:
             try:
                 io_start = time.monotonic()
                 with self._session_lock:
-                    r = self._session.post(SEARCH_URL, json=payload, timeout=self.TIMEOUT)
+                    r = self._session.post(f"{self.base}{SEARCH_PATH}", json=payload, timeout=self.TIMEOUT)
                 io_latency = time.monotonic() - io_start
                 logger.info(
                     f"Search javobi (urinish {attempt}/{self.MAX_RETRIES}, "
@@ -219,6 +279,8 @@ class RailwayClient:
                             self._session.cookies.clear()
                         self._init_session()
                         continue
+                    # Yangi sessiya ham yordam bermadi — keyingi sikl zaxira manzilni sinaydi
+                    self._rotate_base()
                     return SearchResult(False, [], last_error)
 
                 if r.status_code == 403:

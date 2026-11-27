@@ -227,3 +227,36 @@ class TestRetryDoesNotBlockOtherRoutes:
             "backoff kutishi bilan to'silgandek ko'rinadi (session_lock "
             "retry sleep davomida ushlab turilgan bo'lishi mumkin)"
         )
+
+
+class TestBaseUrlAdaptation:
+    def test_405_twice_rotates_to_fallback_base(self, monkeypatch):
+        client = _make_client(monkeypatch, [_FakeResponse(405, text="x")] * 3)
+        first = client.base
+        result = client.search_trains("A", "B", "2030-01-01")
+        assert result.error == "http_405"
+        assert client.base != first
+        assert "uzrailpass" in client.base or "railway.uz" in client.base
+
+    def test_search_uses_current_base(self, monkeypatch):
+        payload = {"data": {"directions": {"forward": {"trains": [{"number": "1"}]}}}}
+        client = _make_client(monkeypatch, [_FakeResponse(200, json_data=payload)])
+        urls = []
+        real = client._session.post
+        client._session.post = lambda url, **kw: (urls.append(url), real(url, **kw))[1]
+        client._adopt_base("https://eticket.uzrailpass.uz")
+        client.search_trains("A", "B", "2030-01-01")
+        assert urls == ["https://eticket.uzrailpass.uz/api/v3/handbook/trains/list"]
+
+    def test_origin_helper(self):
+        from railway_client import _origin
+        assert _origin("https://h.uz/uz/home?x=1") == "https://h.uz"
+        assert _origin("") == "" and _origin("nonsense") == ""
+
+    def test_configured_base_overrides_primary(self, monkeypatch):
+        from config import Config
+        monkeypatch.setattr(Config, "RAILWAY_BASE_URL", "https://eticket.uzrailpass.uz")
+        monkeypatch.setattr(RailwayClient, "_init_session", lambda self: None)
+        c = RailwayClient()
+        assert c.base == "https://eticket.uzrailpass.uz"
+        assert "https://eticket.railway.uz" in c._bases
