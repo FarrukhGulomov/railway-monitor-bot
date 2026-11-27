@@ -2247,6 +2247,24 @@ async def _monitor_loop(uid: int, mid: str, data: dict, app):
                     f"mid={mid}: qidiruv muvaffaqiyatsiz ({result.error}), "
                     f"ketma-ket xato={consecutive_errors}"
                 )
+                if result.error == "risk_blocked":
+                    # Sayt xavf tizimi bloki: muddat tugaguncha urinmaymiz va
+                    # foydalanuvchiga BIR MARTA aniq sababini aytamiz.
+                    until = client.blocked_until() if hasattr(client, "blocked_until") else 0
+                    if not error_notice_sent:
+                        until_txt = datetime.fromtimestamp(until).strftime("%d.%m %H:%M") if until else "noma'lum"
+                        await app.bot.send_message(
+                            uid,
+                            "⛔ Sayt bot so'rovlarini vaqtincha cheklab qo'ydi (xavfsizlik tizimi).\n"
+                            f"Taxminan *{until_txt}* gacha bot tekshira olmaydi — bu vaqtda biletni "
+                            "saytda o'zingiz tekshiring. Cheklov tugagach kuzatuv o'zi davom etadi.\n"
+                            f"🆔 `{mid}`",
+                            parse_mode="Markdown",
+                        )
+                        error_notice_sent = True
+                    remaining = max(until - time.time(), 0) if until else 600
+                    sleep_duration = min(max(remaining, Config.CHECK_INTERVAL), 600)
+                    raise _SkipCycle()
                 if consecutive_errors == MAX_CONSECUTIVE_ERRORS_BEFORE_NOTICE and not error_notice_sent:
                     await app.bot.send_message(
                         uid,

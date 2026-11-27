@@ -71,7 +71,8 @@ class TestRateLimitAdaptation:
     def test_retry_after_header_respected_and_capped(self, monkeypatch):
         client = _make_client(monkeypatch, [])
         assert client._on_rate_limited({"Retry-After": "7"}) == 7
-        assert client._on_rate_limited({"Retry-After": "9999"}) == client.MAX_COOLDOWN
+        assert client._on_rate_limited({"Retry-After": "200"}) == client.MAX_COOLDOWN   # qisqa — cheklanadi
+        assert client._on_rate_limited({"Retry-After": "9999"}) == 9999                 # uzoq — blok, to'liq hurmat
 
     def test_backoff_doubles_without_header(self, monkeypatch):
         client = _make_client(monkeypatch, [])
@@ -189,3 +190,68 @@ class TestRepeated429RefreshesSession:
         client._cooldown_until = 0
         client.search_trains("A", "B", "2030-01-01")
         assert inits == [1]                     # ikkinchisida sessiya yangilandi
+
+
+RISK_BODY = ('{"messageLevel":"WARN","code":429,"message":{"uz":"Bron qilish vaqtincha cheklangan."},'
+             '"parameters":{"riskCode":"RISK_DENIED"}}')
+
+
+class TestRiskDeniedBlockIsHonored:
+    def test_long_retry_after_is_not_capped_and_stops_requests(self, monkeypatch):
+        import time as t
+        client = _make_client(monkeypatch, [_FakeResponse(429, text=RISK_BODY,
+                                                          headers={"retry-after": "85916"})])
+        r = client.search_trains("A", "B", "2030-01-01")
+        assert r.error == "risk_blocked"
+        assert client.blocked_until() > t.time() + 85000          # to'liq muddat hurmat qilinadi
+        # Keyingi chaqiruvlar saytga umuman bormaydi
+        r2 = client.search_trains("A", "B", "2030-01-01")
+        assert r2.error == "risk_blocked" and client._session.calls == 1
+        assert client.get_train_places({"number": "1", "subRoute": {"depStationCode": "1", "arvStationCode": "2"}}, "d") is None
+        assert client._session.calls == 1
+
+    def test_risk_code_without_long_header_still_blocks(self, monkeypatch):
+        client = _make_client(monkeypatch, [_FakeResponse(429, text=RISK_BODY, headers={})])
+        assert client.search_trains("A", "B", "2030-01-01").error == "risk_blocked"
+        assert client.blocked_until() > 0
+
+    def test_ordinary_429_is_not_a_block(self, monkeypatch):
+        client = _make_client(monkeypatch, [_FakeResponse(429, text="slow down", headers={"Retry-After": "5"})])
+        assert client.search_trains("A", "B", "2030-01-01").error == "429 rate limited"
+        assert client.blocked_until() == 0
+
+    def test_monitor_notifies_once_and_waits_long(self, bot_module, tmp_path, monkeypatch):
+        import time as t
+        from database import Database
+        from tests.test_monitor_loop import MON, _fixed_now
+        db = Database(path=str(tmp_path / "d.json"))
+        monkeypatch.setattr(bot_module, "db", db)
+        monkeypatch.setattr(bot_module, "datetime", _fixed_now(bot_module, 2030, 1, 10, 10, 0))
+
+        class Client:
+            def blocked_until(self):
+                return t.time() + 3600
+
+        async def fake_search(*a, **kw):
+            return bot_module.SearchResult(False, [], "risk_blocked")
+
+        async def fake_client():
+            return Client()
+
+        mon = dict(MON, date="2030-01-10")
+        mid = db.save_monitor(100, mon)
+        slept = []
+
+        async def fake_sleep(sec):
+            slept.append(sec)
+            if len(slept) >= 3:
+                db.deactivate(mid)
+
+        monkeypatch.setattr(bot_module, "_shared_search", fake_search)
+        monkeypatch.setattr(bot_module, "_get_railway_client", fake_client)
+        monkeypatch.setattr(bot_module.asyncio, "sleep", fake_sleep)
+        app = MagicMock(); app.bot.send_message = AsyncMock()
+        asyncio.run(bot_module._monitor_loop(100, mid, dict(mon, id=mid), app))
+        assert app.bot.send_message.await_count == 1             # faqat bir marta
+        assert "cheklab qo'ydi" in app.bot.send_message.await_args.args[1]
+        assert all(s == 600 for s in slept)                       # har 10 daqiqada bir tekshiradi, saytga emas
