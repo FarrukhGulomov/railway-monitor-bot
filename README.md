@@ -265,3 +265,11 @@ MIT — shaxsiy foydalanish uchun erkin.
 - Sotuv odatda **60 kun oldin 10:00** da ochiladi — uzoq sana tanlansa, bot ogohlantiradi va sotuv ochilishini kutadi.
 - Sayt texnik tanaffusi **02:30–03:00** — bu vaqtda bot so'rov yubormaydi va xato sanamaydi.
 - Sayt domeni ko'chgan bo'lishi mumkin (`eticket.uzrailpass.uz`): klient redirektni kuzatadi, 405 davom etsa zaxira manzilga o'tadi; `RAILWAY_BASE_URL` bilan qo'lda ham belgilanadi.
+
+## API hujjati va stansiyalar
+
+- Sayt API'si bo'yicha tahlil: [`docs/UZRAILPASS_API.md`](docs/UZRAILPASS_API.md) (rasmiy emas, o'zgarishi mumkin).
+- Stansiya kodlari shu hujjat asosida tuzatildi (eski kodlarning ko'pi boshqa shaharga tegishli edi). Mavjud kuzatuvlar bot ishga tushganda bir marta avtomatik migratsiya qilinadi (`stations_v2` belgisi).
+- Sayt so'rovlar chegarasiga (429) moslashadi: umumiy sovutish + interval vaqtincha kengayadi, muvaffaqiyatda tiklanadi.
+- Bilet topilganda xabarda vagon va bo'sh joy raqamlari ko'rsatiladi (ko'pi bilan 3 poyezd, saytga yuk oshmasligi uchun).
+- Bron va to'lov botda YO'Q: foydalanuvchi o'zi saytda bajaradi (karta/SMS/parol bot orqali o'tmaydi).

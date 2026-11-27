@@ -65,18 +65,50 @@ WAIT_CONFIRM = 10
 WAIT_BRAND = 11
 
 # ─── Konstantalar ───────────────────────────────────────────────────────────────
+# Kodlar railway.uz (uzrailpass) stations/list va real qidiruv bilan TEKSHIRILGAN
+# (qarang: docs/UZRAILPASS_API.md). Eski kodlarning ko'pi boshqa stansiyaga
+# tegishli bo'lgan (masalan 2900680 — Andijon, Samarqand emas).
 STATIONS = {
     "🏙 Toshkent":   "2900000",
-    "🕌 Samarqand":  "2900680",
+    "🕌 Samarqand":  "2900700",
     "🕌 Buxoro":     "2900800",
-    "🏔 Andijon":    "2900100",
-    "🌿 Namangan":   "2900200",
-    "🌾 Farg'ona":   "2900210",
-    "🌄 Qarshi":     "2900900",
-    "🌊 Nukus":      "2900350",
-    "🌿 Urganch":    "2900300",
-    "☀️ Termiz":     "2901100",
+    "🏔 Andijon":    "2900680",
+    "🌿 Namangan":   "2900940",
+    "🌾 Marg'ilon":  "2900920",
+    "🍇 Qo'qon":     "2900880",
+    "🌄 Qarshi":     "2900750",
+    "🌊 Nukus":      "2900970",
+    "🌿 Urganch":    "2900790",
+    "🏯 Xiva":       "2900172",
+    "☀️ Termiz":     "2900255",
+    "🏙 Navoiy":     "2900930",
+    "🌳 Jizzax":     "2900720",
+    "🌆 Guliston":   "2900236",
 }
+
+# Eski (noto'g'ri) kod → to'g'ri kod. Faqat kuzatuvda stansiya NOMI topilmasa
+# zaxira sifatida ishlatiladi; bir o'tishda qo'llanadi (2900680 eski ma'noda
+# Samarqand, yangisida Andijon — shuning uchun zanjir bo'lmasligi shart).
+STATION_FIX = {
+    "2900680": "2900700", "2900100": "2900680", "2900200": "2900940",
+    "2900900": "2900750", "2900350": "2900970", "2900300": "2900790",
+    "2901100": "2900255",
+}
+
+
+def _migrate_station_codes(m: dict):
+    """Eski kuzatuvdagi stansiya kodlarini tuzatadi (bir marta: `stations_v2`).
+    Avval stansiya NOMI bo'yicha (foydalanuvchi aynan shuni tanlagan), nom
+    topilmasa eski kod jadvali bo'yicha. O'zgarish yo'q bo'lsa None."""
+    if m.get("stations_v2"):
+        return None
+    changes = {"stations_v2": True}
+    for side in ("from", "to"):
+        code, name = m.get(f"{side}_code"), m.get(f"{side}_name")
+        new = STATIONS.get(name) or STATION_FIX.get(str(code), code)
+        if new != code:
+            changes[f"{side}_code"] = new
+    return changes
 STATIONS_REV = {v: k for k, v in STATIONS.items()}
 
 CAR_TYPES = {
@@ -1513,7 +1545,7 @@ async def _confirm_and_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "max_price": ud.get("max_price"),
         "min_seats": ud.get("min_seats", 1),
         "active": True, "created_at": datetime.now().isoformat(),
-        "check_count": 0, "last_check": None,
+        "check_count": 0, "last_check": None, "stations_v2": True,
     }
     mid = db.save_monitor(uid, monitor)
     if mid is None:
@@ -1995,6 +2027,59 @@ MAX_CONSECUTIVE_ERRORS_BEFORE_NOTICE = 5
 MAX_ERROR_BACKOFF = 300  # soniya — API xatosi davom etsa kutish shu chegaradan oshmaydi
 
 
+MAX_PLACES_TRAINS = 3   # xabarga vagon/joy raqami qo'shiladigan poyezdlar soni (saytga yuk oshmasligi uchun)
+MAX_PLACES_CARS = 3
+MAX_PLACES_PER_CAR = 8
+
+
+async def _fetch_places(client, to_show: list, date_iso: str) -> dict:
+    """Topilgan poyezdlar uchun vagon/joy raqamlari (poyezd raqami -> carGroup).
+    Xato yoki noma'lum bo'lsa — jim o'tkazib yuboriladi (xabar baribir ketadi)."""
+    fn = getattr(client, "get_train_places", None)
+    out, seen = {}, set()
+    if not fn:
+        return out
+    for item in to_show:
+        train = item[0]
+        number = train.get("number")
+        if number in seen or len(seen) >= MAX_PLACES_TRAINS:
+            continue
+        seen.add(number)
+        try:
+            groups = await asyncio.to_thread(fn, train, date_iso)
+        except Exception as e:
+            logger.info(f"Joy tafsiloti xato ({number}): {e}")
+            groups = None
+        if groups:
+            out[number] = groups
+    return out
+
+
+def _places_line(groups, car_type: Optional[str]) -> str:
+    """'🚃 Vagon 04: 34, 36 · 05: 2' ko'rinishi (mos vagon guruhi topilmasa bo'sh)."""
+    if not isinstance(groups, list) or not car_type:
+        return ""
+    want = car_type.strip().lower()
+    parts = []
+    for g in groups:
+        if not isinstance(g, dict):
+            continue
+        names = [str(g.get(k) or "").strip().lower() for k in ("type", "typeShow", "actualType")]
+        if not any(n and (n == want or n in want or want in n) for n in names):
+            continue
+        for c in (g.get("cars") or []):
+            if not isinstance(c, dict) or not c.get("places"):
+                continue
+            places = [str(x) for x in c["places"]]
+            shown = ", ".join(places[:MAX_PLACES_PER_CAR]) + (" …" if len(places) > MAX_PLACES_PER_CAR else "")
+            parts.append(f"{c.get('number', '?')}: {shown}")
+            if len(parts) >= MAX_PLACES_CARS:
+                break
+        if len(parts) >= MAX_PLACES_CARS:
+            break
+    return ("🚃 Vagon " + " · ".join(parts)) if parts else ""
+
+
 class _SkipCycle(Exception):
     """Monitor siklini qidiruvsiz o'tkazib yuborish uchun ichki signal."""
 
@@ -2208,13 +2293,14 @@ async def _monitor_loop(uid: int, mid: str, data: dict, app):
                     to_show = found if first_run else [
                         f for f in found if _train_fingerprint(f) in new_fingerprints
                     ]
-                    link = "https://eticket.railway.uz"
+                    link = "https://eticket.uzrailpass.uz/uz/home"
                     header = (
                         f"📋 *Hozirda mavjud biletlar ({len(to_show)} ta variant):*\n"
                         if first_run else
                         f"🎯 *Yangi joy topildi! ({len(to_show)} ta variant)*\n"
                     )
                     lines = [header]
+                    places_by_train = await _fetch_places(client, to_show, data["date"])
                     prev_key = None
                     for train, car, price, tariff_seats, service_type in to_show:
                         dep_date, time_str = _split_dt(train.get("departureDate", ""))
@@ -2234,6 +2320,9 @@ async def _monitor_loop(uid: int, mid: str, data: dict, app):
                         ctype_label = car.get("type") if isinstance(car, dict) else None
                         label = f"{ctype_label} ({service_type})" if ctype_label and ctype_label != service_type else service_type
                         lines.append(f"   💺 {label}: {tariff_seats} joy | 💰 {price:,} so'm")
+                        pl = _places_line(places_by_train.get(number), ctype_label)
+                        if pl:
+                            lines.append(f"      {pl}")
 
                     lines.append(f"\n🚉 {data['from_name']} → {data['to_name']}  |  📅 {_fmt_iso_date(data.get('date'))}")
                     lines.append(f"\n👉 [Bilet sotib olish]({link})")
@@ -2572,6 +2661,9 @@ async def _set_commands(app):
 
 async def _post_init(app):
     await _set_commands(app)
+    migrated = db.migrate_monitors(_migrate_station_codes)
+    if migrated:
+        logger.warning(f"🔧 {migrated} ta kuzatuvda stansiya kodlari tuzatildi (stations_v2)")
     await _resume_monitors(app)
 
 
