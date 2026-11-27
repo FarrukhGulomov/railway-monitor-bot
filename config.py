@@ -43,7 +43,7 @@ class Config:
     # tezligi bundan MUSTAQIL, alohida RAILWAY_MIN_REQUEST_INTERVAL (standart
     # 5s) va single-flight kesh orqali cheklanadi, shuning uchun CHECK_INTERVAL
     # pastligi saytga haddan tashqari yuklama bermaydi.
-    CHECK_INTERVAL: int = max(3, int(os.getenv("CHECK_INTERVAL", "5")))
+    CHECK_INTERVAL: int = max(3, int(os.getenv("CHECK_INTERVAL", "15")))
 
     # Bir foydalanuvchida max monitoring soni
     # Sayt manzili (asosiy). Domen ko'chsa Variables'dan o'zgartirish mumkin;
