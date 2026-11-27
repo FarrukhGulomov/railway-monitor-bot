@@ -67,8 +67,12 @@ def _default_min_interval() -> float:
 
 
 class RailwayClient:
-    TIMEOUT = 20
-    MAX_RETRIES = 3
+    # Sayt osilib qolsa (504 odatda ~15s'dan keyin keladi) uzoq kutmaymiz — monitor
+    # sikli o'zi har CHECK_INTERVAL'da qayta urinadi. Ichki retry faqat TEZ
+    # (<FAST_FAIL_SECONDS) xatolar uchun, shunda sikl ~5s ritmidan chiqib ketmaydi.
+    TIMEOUT = 10
+    MAX_RETRIES = 2
+    FAST_FAIL_SECONDS = 5.0
 
     def __init__(self, min_interval: float = None):
         self._session = cffi_requests.Session(impersonate="chrome124")
@@ -203,6 +207,20 @@ class RailwayClient:
                     last_error = "401 unauthorized"
                     continue
 
+                if r.status_code == 405:
+                    # POST rad etildi (odatda ~1s ichida): eskirgan/yaroqsiz
+                    # session yoki himoya qatlami. Cookie'larni tozalab yangi
+                    # session bilan bir marta qayta urinamiz.
+                    metrics.incr("railway_405_total")
+                    logger.warning("405 Method Not Allowed — session qayta yaratilmoqda")
+                    last_error = "http_405"
+                    if attempt < self.MAX_RETRIES:
+                        with self._session_lock:
+                            self._session.cookies.clear()
+                        self._init_session()
+                        continue
+                    return SearchResult(False, [], last_error)
+
                 if r.status_code == 403:
                     logger.error(f"403 Forbidden: {r.text[:200]}")
                     if "CSRF" in r.text and attempt < self.MAX_RETRIES:
@@ -258,8 +276,9 @@ class RailwayClient:
                         f"{r.text[:200]}"
                     )
                     last_error = f"http_{r.status_code}"
-                    if attempt < self.MAX_RETRIES:
-                        time.sleep(2 * attempt)
+                    # Tez qaytgan xato (502/503) — bir marta darhol qayta
+                    # urinamiz; sekin (504/timeout) bo'lsa — keyingi sikl kutadi.
+                    if attempt < self.MAX_RETRIES and io_latency < self.FAST_FAIL_SECONDS:
                         continue
                     return SearchResult(False, [], last_error)
 
@@ -295,7 +314,9 @@ class RailwayClient:
                 metrics.incr("railway_timeouts_total" if is_timeout else "railway_exceptions_total")
                 logger.error(f"Search xato (urinish {attempt}): {e}")
                 last_error = f"exception: {e}"
+                if is_timeout:
+                    break  # osilib qolgan sayt — keyingi sikl qayta urinadi
                 if attempt < self.MAX_RETRIES:
-                    time.sleep(3)
+                    time.sleep(1)
 
         return SearchResult(False, [], last_error)

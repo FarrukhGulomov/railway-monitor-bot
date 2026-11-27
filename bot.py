@@ -1434,13 +1434,38 @@ CHECKING_LINE = "⏳ Hozirgi mavjud biletlar tekshirilmoqda..."
 NOTHING_YET_LINE = "🔎 Tekshirildi — hozircha mos bilet yo'q. Chiqishi bilan darhol xabar beraman."
 
 
+SITE_DOWN_LINE = (
+    "⚠️ Sayt hozir javob bermayapti (vaqtinchalik). Qayta urinishda davom etyapman — "
+    "bilet chiqsa darhol xabar beraman."
+)
+
+
+async def _mark_confirm_site_down(app, mid: str):
+    """Birinchi tekshiruv saytning xatosi tufayli bajarilmasa, tasdiq xabari
+    'tekshirilmoqda' deb osilib qolmasligi uchun bir marta tahrirlanadi.
+    Yozuv saqlanadi — sayt tiklanganda yakuniy holat yoziladi."""
+    entry = _confirm_messages.get(mid)
+    if not entry:
+        return
+    chat_id, message_id, text = entry
+    if SITE_DOWN_LINE in text:
+        return
+    new_text = text.replace(CHECKING_LINE, SITE_DOWN_LINE)
+    _confirm_messages[mid] = (chat_id, message_id, new_text)
+    try:
+        await app.bot.edit_message_text(
+            new_text, chat_id=chat_id, message_id=message_id, parse_mode="Markdown")
+    except Exception as e:
+        logger.info(f"Tasdiq xabarini tahrirlab bo'lmadi: {e}")
+
+
 async def _finish_confirm_message(app, mid: str, found_any: bool):
     entry = _confirm_messages.pop(mid, None)
     if not entry:
         return
     chat_id, message_id, text = entry
     new_line = "✅ Tekshirildi — mavjud biletlar yuqoridagi xabarda." if found_any else NOTHING_YET_LINE
-    new_text = text.replace(CHECKING_LINE, new_line) if text else new_line
+    new_text = text.replace(CHECKING_LINE, new_line).replace(SITE_DOWN_LINE, new_line) if text else new_line
     try:
         await app.bot.edit_message_text(
             new_text, chat_id=chat_id, message_id=message_id, parse_mode="Markdown")
@@ -1946,6 +1971,15 @@ MAX_CONSECUTIVE_ERRORS_BEFORE_NOTICE = 5
 MAX_ERROR_BACKOFF = 300  # soniya — API xatosi davom etsa kutish shu chegaradan oshmaydi
 
 
+def _error_sleep(check_interval: float, consecutive_errors: int) -> float:
+    """Sayt xato bersa ham ritm deyarli o'zgarmaydi: dastlabki 5 ta xatoda —
+    oddiy CHECK_INTERVAL, keyin ko'pi bilan 3 baravargacha (sayt uzoq ishlamasa
+    unga ortiqcha bosim bermaslik uchun). Eski usul 5x gacha ko'paytirib,
+    foydalanuvchi va'da qilingan 5s o'rniga 30-45s kutishiga olib kelardi."""
+    factor = min(1 + consecutive_errors // 6, 3)
+    return min(check_interval * factor, MAX_ERROR_BACKOFF)
+
+
 def _fmt_iso_date(iso: str) -> str:
     """'2026-10-31' -> '31.10.2026' (xabarlarda sana ko'rinishi uchun)."""
     try:
@@ -2089,9 +2123,9 @@ async def _monitor_loop(uid: int, mid: str, data: dict, app):
                         parse_mode="Markdown",
                     )
                     error_notice_sent = True
-                sleep_duration = min(
-                    Config.CHECK_INTERVAL * min(consecutive_errors, 5), MAX_ERROR_BACKOFF
-                )
+                sleep_duration = _error_sleep(Config.CHECK_INTERVAL, consecutive_errors)
+                if first_run:
+                    await _mark_confirm_site_down(app, mid)
             else:
                 if error_notice_sent:
                     await app.bot.send_message(
