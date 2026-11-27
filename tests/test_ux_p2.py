@@ -79,3 +79,60 @@ class TestCommandNamesValidForTelegram:
         import re
         for c in bot_module.ADMIN_COMMANDS:
             assert re.fullmatch(r"[a-z0-9_]{1,32}", c.command), c.command
+
+
+class TestSiteRulesFromDocs:
+    def test_seat_limit_is_four_per_order(self, bot_module):
+        assert bot_module.MAX_SEATS_LIMIT == 4
+
+    def test_tech_break_window(self, bot_module):
+        from datetime import datetime as dt
+        w = bot_module._tech_break_wait
+        assert w(dt(2030, 1, 1, 2, 29, 59)) == 0
+        assert w(dt(2030, 1, 1, 2, 30, 0)) == 1800
+        assert w(dt(2030, 1, 1, 2, 45, 0)) == 900
+        assert w(dt(2030, 1, 1, 3, 0, 0)) == 0
+
+    def test_sales_note_only_beyond_window(self, bot_module):
+        near = (datetime.now() + timedelta(days=10)).strftime("%Y-%m-%d")
+        far = (datetime.now() + timedelta(days=90)).strftime("%Y-%m-%d")
+        assert bot_module._sales_note(near) == ""
+        assert "sotuv hali ochilmagan" in bot_module._sales_note(far)
+        assert bot_module._sales_note("bad") == ""
+
+    def test_confirm_step_warns_for_far_date(self, bot_module):
+        far = (datetime.now() + timedelta(days=90)).strftime("%Y-%m-%d")
+        text, _ = bot_module._step_view("confirm", {"date": far})
+        assert "sotuv hali ochilmagan" in text
+
+    def test_monitor_skips_search_during_tech_break(self, bot_module, tmp_path, monkeypatch):
+        from database import Database
+        from tests.test_monitor_loop import MON, _fixed_now
+        db = Database(path=str(tmp_path / "d.json"))
+        monkeypatch.setattr(bot_module, "db", db)
+        monkeypatch.setattr(bot_module, "datetime", _fixed_now(bot_module, 2030, 1, 10, 2, 40))
+        calls = {"n": 0}
+
+        async def fake_search(*a, **kw):
+            calls["n"] += 1
+            return bot_module.SearchResult(False, [], "http_504")
+
+        async def fake_client():
+            return object()
+
+        mon = dict(MON, date="2030-01-10")
+        mid = db.save_monitor(100, mon)
+        slept = []
+
+        async def fake_sleep(sec):
+            slept.append(sec)
+            db.deactivate(mid)
+
+        monkeypatch.setattr(bot_module, "_shared_search", fake_search)
+        monkeypatch.setattr(bot_module, "_get_railway_client", fake_client)
+        monkeypatch.setattr(bot_module.asyncio, "sleep", fake_sleep)
+        app = MagicMock(); app.bot.send_message = AsyncMock()
+        asyncio.run(bot_module._monitor_loop(100, mid, dict(mon, id=mid), app))
+        assert calls["n"] == 0                # tanaffusda so'rov yo'q
+        assert slept == [60]                   # 20 daqiqa qolgan — 60s dan oshmaydi
+        app.bot.send_message.assert_not_awaited()

@@ -46,6 +46,9 @@ class Config:
     CHECK_INTERVAL: int = max(3, int(os.getenv("CHECK_INTERVAL", "5")))
 
     # Bir foydalanuvchida max monitoring soni
+    # Sayt manzili (asosiy). Domen ko'chsa Variables'dan o'zgartirish mumkin;
+    # klient redirekt va 405 holatida zaxira manzilga o'zi ham o'tadi.
+    RAILWAY_BASE_URL: str = os.getenv("RAILWAY_BASE_URL", "https://eticket.railway.uz").strip()
     MAX_MONITORS_PER_USER: int = int(os.getenv("MAX_MONITORS_PER_USER", "3"))
 
     # ── Railway.uz so'rov rejalashtiruvchisi (scheduler) ──────────────────────────
