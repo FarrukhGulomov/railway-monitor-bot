@@ -136,6 +136,25 @@ class Database:
                 return []
         return removed
 
+    def migrate_monitors(self, mapper) -> int:
+        """Barcha kuzatuvlarga `mapper(monitor) -> dict|None` ni BIR atomik yozuvda
+        qo'llaydi (masalan, stansiya kodlarini tuzatish). O'zgargan kuzatuvlar
+        sonini qaytaradi; yozuv muvaffaqiyatsiz bo'lsa 0 (hech narsa o'zgarmagan)."""
+        changed = 0
+        with _lock:
+            data = self._read()
+            for m in data["monitors"].values():
+                changes = mapper(m)
+                if changes:
+                    m.update(changes)
+                    changed += 1
+            if not changed:
+                return 0
+            if not self._write(data):
+                logger.error("migrate_monitors: yozuv muvaffaqiyatsiz — hech narsa o'zgarmadi")
+                return 0
+        return changed
+
     def is_active(self, mid: str) -> bool:
         with _lock:
             data = self._read()

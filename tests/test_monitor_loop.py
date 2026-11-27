@@ -306,7 +306,7 @@ class TestFoundMessageButtons:
         markup = calls[0].kwargs["reply_markup"]
         datas = [b.callback_data for row in markup.inline_keyboard for b in row]
         urls = [b.url for row in markup.inline_keyboard for b in row]
-        assert "https://eticket.railway.uz" in urls
+        assert "https://eticket.uzrailpass.uz/uz/home" in urls
         assert not any(d and d.startswith("rep|") for d in datas)  # monitor davom etadi
 
     def test_new_find_has_repeat_button(self, bot_module, fresh_db, monkeypatch):

@@ -193,7 +193,7 @@ class TestRetryDoesNotBlockOtherRoutes:
                 from_code = json["directions"]["forward"]["depStationCode"]
                 if from_code == "ROUTE_A":
                     route_a_started.set()
-                    return _FakeResponse(429, headers={"Retry-After": "1"})
+                    raise RuntimeError("tarmoq uzildi")  # ichki 1s kutish (lock'siz)
                 return _FakeResponse(200, json_data=payload_ok)
 
         client._session = _RoutingSession([])

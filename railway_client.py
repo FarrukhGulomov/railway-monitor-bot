@@ -35,11 +35,12 @@ from metrics import metrics
 
 logger = logging.getLogger("railway_client")
 
-BASE = "https://eticket.railway.uz"
-# Sayt (hujjatlarga ko'ra) eticket.uzrailpass.uz domeniga ko'chgan bo'lishi
-# mumkin. Aniq API kontrakti tasdiqlanmagani uchun klient ikkala manzilni
-# biladi: redirektni kuzatadi va 405 davom etsa zaxira manzilga o'tadi.
-FALLBACK_BASES = ["https://eticket.uzrailpass.uz"]
+BASE = "https://eticket.uzrailpass.uz"
+# Sayt eski domen (eticket.railway.uz) dan yangisiga ko'chgan (prod loglarida
+# tasdiqlangan). Eski manzil zaxira sifatida qoldirilgan: klient redirektni
+# kuzatadi va 405 davom etsa zaxira manzilga o'tadi.
+FALLBACK_BASES = ["https://eticket.railway.uz"]
+PLACES_PATH = "/api/v1/handbook/trains"
 SEARCH_PATH = "/api/v3/handbook/trains/list"
 SEARCH_URL = f"{BASE}{SEARCH_PATH}"
 
@@ -103,6 +104,12 @@ class RailwayClient:
         self._session = cffi_requests.Session(impersonate="chrome124")
         self._session.headers.update(HEADERS)
         self._last_request = 0.0
+        # Sayt so'rovlar chegarasi (429): butun klient uchun UMUMIY sovutish.
+        # Bitta marshrut 429 olsa, boshqalari ham shu IP'dan ketayotgani uchun
+        # kutadi; interval esa sekin-asta kengayib, muvaffaqiyatda tiklanadi.
+        self._cooldown_until = 0.0
+        self._consecutive_429 = 0
+        self._extra_interval = 0.0
         primary = _configured_base()
         self._bases = [primary] + [b for b in [BASE] + FALLBACK_BASES if b != primary]
         self._base_idx = 0
@@ -199,6 +206,28 @@ class RailwayClient:
             pass
         return ""
 
+    MAX_COOLDOWN = 120.0
+    MAX_EXTRA_INTERVAL = 10.0
+
+    def _on_rate_limited(self, headers) -> float:
+        """429 kelganda umumiy sovutish muddatini belgilaydi: Retry-After bo'lsa
+        shu (<=MAX_COOLDOWN), bo'lmasa 30s dan boshlab ikki baravar oshib boradi."""
+        try:
+            wait = float(headers.get("Retry-After"))
+        except (TypeError, ValueError, AttributeError):
+            wait = 30.0 * (2 ** min(self._consecutive_429, 2))
+        wait = max(1.0, min(wait, self.MAX_COOLDOWN))
+        with self._pacing_lock:
+            self._consecutive_429 += 1
+            self._cooldown_until = max(self._cooldown_until, time.monotonic() + wait)
+            self._extra_interval = min(self._extra_interval + 2.0, self.MAX_EXTRA_INTERVAL)
+        return wait
+
+    def _on_success(self):
+        with self._pacing_lock:
+            self._consecutive_429 = 0
+            self._extra_interval = max(0.0, self._extra_interval - 0.25)
+
     def _throttle(self):
         """Barcha marshrutlar uchun UMUMIY (global) minimal so'rov oralig'ini
         ta'minlaydi. Lock faqat vaqt belgisini o'qish/yangilash uchun qisqa
@@ -208,7 +237,10 @@ class RailwayClient:
         while True:
             with self._pacing_lock:
                 now = time.monotonic()
-                wait = self.MIN_INTERVAL - (now - self._last_request)
+                wait = max(
+                    self.MIN_INTERVAL + self._extra_interval - (now - self._last_request),
+                    self._cooldown_until - now,
+                )
                 if wait <= 0:
                     self._last_request = now
                     return
@@ -323,11 +355,14 @@ class RailwayClient:
 
                 if r.status_code == 429:
                     metrics.incr("railway_429_total")
-                    wait = min(int(r.headers.get("Retry-After", 30)), 30)
-                    logger.warning(f"Rate limit — {wait}s")
-                    time.sleep(wait)
-                    last_error = "429 rate limited"
-                    continue
+                    wait = self._on_rate_limited(r.headers)
+                    logger.warning(
+                        f"Rate limit (429) — umumiy sovutish {wait:.0f}s, "
+                        f"interval +{self._extra_interval:.0f}s"
+                    )
+                    # Ichida qayta urinmaymiz: bosimni oshirmaslik uchun keyingi
+                    # urinish umumiy sovutishdan keyin (_throttle) amalga oshadi.
+                    return SearchResult(False, [], "429 rate limited")
 
                 if 500 <= r.status_code < 600:
                     # Serverning o'tkinchi (transient) xatosi — saytga qarshi
@@ -361,6 +396,7 @@ class RailwayClient:
                         continue
                     return SearchResult(False, [], last_error)
 
+                self._on_success()
                 trains = (
                     data.get("data", {})
                     .get("directions", {})
@@ -382,3 +418,33 @@ class RailwayClient:
                     time.sleep(1)
 
         return SearchResult(False, [], last_error)
+
+    def get_train_places(self, train: dict, date_iso: str):
+        """Poyezdning vagonlari va bo'sh joy RAQAMLARI (`POST /api/v1/handbook/trains`).
+        Faqat mos variant topilgandan keyin chaqiriladi. None — xato/noma'lum
+        (bu "joy yo'q" degani EMAS); aks holda `carGroup` ro'yxati."""
+        route = train.get("subRoute") or {}
+        payload = {
+            "depDate": date_iso,
+            "depStationCode": route.get("depStationCode"),
+            "arvStationCode": route.get("arvStationCode"),
+            "trainNumber": train.get("number"),
+            "trainId": train.get("trainId"),
+        }
+        if not payload["depStationCode"] or not payload["arvStationCode"] or not payload["trainNumber"]:
+            return None
+        try:
+            self._throttle()
+            metrics.incr("railway_requests_total")
+            with self._session_lock:
+                r = self._session.post(f"{self.base}{PLACES_PATH}", json=payload, timeout=self.TIMEOUT)
+            if r.status_code == 429:
+                self._on_rate_limited(r.headers)
+                return None
+            if r.status_code != 200:
+                logger.info(f"Joy tafsiloti: status {r.status_code}")
+                return None
+            return ((r.json().get("data") or {}).get("train") or {}).get("carGroup")
+        except Exception as e:
+            logger.info(f"Joy tafsilotini olib bo'lmadi: {e}")
+            return None
